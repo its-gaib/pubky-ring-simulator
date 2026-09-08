@@ -5,7 +5,7 @@ production** environments, selected in the interface. It imports an existing ide
 recovery phrase and verifies that the identity is registered with the selected homeserver.
 **Account creation, generated identities, local testnet setup, and Quick Mode are removed.**
 
-**Live simulator:** [pubky-ring-simulator-its-gaib.vercel.app](https://pubky-ring-simulator-its-gaib.vercel.app/)
+**Live simulator:** [pubky-ring-simulator.vercel.app](https://pubky-ring-simulator.vercel.app/)
 
 Fork of [pubky/pubky-ring-simulator](https://github.com/pubky/pubky-ring-simulator).
 The original simulator is designed to create disposable identities on a local testnet.
