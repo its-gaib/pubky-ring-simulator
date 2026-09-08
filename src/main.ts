@@ -2,15 +2,14 @@ import pubkyPackage from "@synonymdev/pubky/package.json";
 import { toSvg } from "jdenticon/browser";
 import "./style.css";
 import {
+  ENVIRONMENTS,
   approveAuthRequest,
-  assertLocalAuthRequest,
-  assertSupportedAuthRequest,
   callbackUrlFor,
-  createIdentity,
-  isIdentityReady,
+  disposeIdentity,
+  importIdentity,
   parseAuthRequest,
-  signUpIdentity,
   type AuthRequestPreview,
+  type EnvironmentId,
   type SignerIdentity,
 } from "./pubky";
 
@@ -28,76 +27,29 @@ declare global {
   }
 }
 
-interface ApprovalHistoryItem {
-  at: string;
-  capabilities: string[];
-  publicKey: string;
+type Route = "identities" | "import" | "identity" | "rename" | "authorize";
+
+interface Feedback {
+  kind: "success" | "error" | "notice";
+  message: string;
+  action?: { label: string; url: string };
 }
-
-interface LoginFeedback {
-  action?: LoginFeedbackAction;
-  detail?: string;
-  kind: "progress" | "success" | "error" | "cancel";
-  title: string;
-}
-
-interface LoginFeedbackAction {
-  label: string;
-  url: string;
-}
-
-type LocalServiceAccess = "waiting" | "checking" | "accessible" | "failed";
-
-interface LocalService {
-  name: string;
-  port: number;
-  purpose: string;
-  url: string;
-}
-
-type Route = "identities" | "identity" | "rename" | "authorize" | "auth";
 
 interface State {
   activeIdentityId?: string;
-  approvals: ApprovalHistoryItem[];
-  authInput: string;
   authRequest?: AuthRequestPreview;
   busy?: string;
-  error?: string;
+  environment: EnvironmentId;
+  feedback?: Feedback;
   identities: SignerIdentity[];
   identityNames: Record<string, string>;
-  localAccessExplanationVisible: boolean;
-  localServiceAccess: Record<number, LocalServiceAccess>;
-  loginFeedback?: LoginFeedback;
-  notice?: string;
+  route: Route;
   scanActive: boolean;
-  scanSource?: "camera" | "screen";
 }
 
-const PUBKY_DOCKER_URL = "https://github.com/pubky/pubky-docker";
 const PUBKY_SDK_URL = "https://www.npmjs.com/package/@synonymdev/pubky";
-const PROJECT_URL = "https://github.com/pubky/pubky-ring-simulator";
-const RING_LOGO_URL = "https://pubkyring.app/pubky-ring-logo.svg";
-const LOCAL_SERVICES: LocalService[] = [
-  {
-    name: "PKARR relay",
-    port: 15411,
-    purpose: "Resolve local Pubkys",
-    url: "http://localhost:15411/",
-  },
-  {
-    name: "Homeserver",
-    port: 6286,
-    purpose: "Sign up and access data",
-    url: "http://localhost:6286/",
-  },
-  {
-    name: "Admin API",
-    port: 6288,
-    purpose: "Create signup tokens",
-    url: "http://127.0.0.1:6288/",
-  },
-];
+const PROJECT_URL = "https://github.com/its-gaib/pubky-ring-simulator";
+const MAX_AUTH_LINK_LENGTH = 16_384;
 const app = getAppElement();
 const htmlEscapes: Record<string, string> = {
   "&": "&amp;",
@@ -107,398 +59,276 @@ const htmlEscapes: Record<string, string> = {
   "'": "&#039;",
 };
 const state: State = {
-  approvals: [],
-  authInput: "",
+  environment: "staging",
   identities: [],
   identityNames: {},
-  localAccessExplanationVisible: false,
-  localServiceAccess: Object.fromEntries(
-    LOCAL_SERVICES.map((service) => [service.port, "checking"]),
-  ),
+  route: "identities",
   scanActive: false,
 };
 
+// Neither recovery phrases nor unparsed auth links belong in application state.
+// Every async completion must still belong to this in-memory session.
+let sessionEpoch = 0;
+let scanEpoch = 0;
 let scanStream: MediaStream | undefined;
 let scanDetector: BarcodeDetectorLike | undefined;
 let scanTimer: number | undefined;
 let scanCanvas: HTMLCanvasElement | undefined;
-let loginFeedbackTimer: number | undefined;
-let localServiceProbeActive = false;
-let localServiceProbeEnabled = false;
-let localServicePermissionPromptPending = false;
-let localServicePermissionStatus: PermissionStatus | undefined;
 
 app.addEventListener("click", handleClick);
 app.addEventListener("submit", handleSubmit);
-app.addEventListener("input", handleInput);
-app.addEventListener("paste", handlePaste);
-app.addEventListener("cancel", handleDialogCancel, true);
-window.addEventListener("hashchange", handleRouteChange);
+window.addEventListener("pagehide", () => clearSession());
+window.addEventListener("pageshow", () => render());
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") void probeLocalServices();
+  if (document.visibilityState === "hidden" && state.scanActive) {
+    stopScanCapture();
+    render();
+  }
 });
 
 render();
-void initializeLocalServiceAccess();
-window.setInterval(() => {
-  void probeLocalServices();
-}, 15_000);
 
 function render() {
-  const route = currentRoute();
-
   app.innerHTML = `
     <main class="site-shell">
-      ${developerBanner()}
+      <aside class="developer-banner">
+        <span class="banner-icon" aria-hidden="true">${codeIcon()}</span>
+        <div>
+          <strong>Ring simulator · hosted edition</strong>
+          <p>Approve requests with an existing identity on staging or production. Your recovery phrase gives this page control of that identity.</p>
+        </div>
+      </aside>
 
       <div class="simulator-layout">
-        ${modeSwitcher(route)}
-
-        <section class="phone-stage" aria-label="Pubky Ring Simulator prototype">
+        ${environmentSwitcher()}
+        <section class="phone-stage" aria-label="Pubky Ring Simulator">
           <div class="phone">
             <span class="phone-button phone-button-volume-up" aria-hidden="true"></span>
             <span class="phone-button phone-button-volume-down" aria-hidden="true"></span>
             <span class="phone-button phone-button-power" aria-hidden="true"></span>
-
             <div class="phone-screen">
-              <div class="phone-island" aria-hidden="true">
-                <span></span>
-              </div>
-
+              <div class="phone-island" aria-hidden="true"><span></span></div>
               <div class="app-surface">
-                ${appHeader(route)}
+                ${appHeader()}
                 <div class="screen-content">
-                  ${pageForRoute(route)}
+                  ${feedbackView()}
+                  ${pageForRoute()}
                 </div>
-                ${loginFeedbackView()}
               </div>
             </div>
           </div>
         </section>
-
-        ${localServicesPanel()}
       </div>
 
       <footer class="site-footer">
-        <span>Identities disappear on page reload.</span>
-        <span class="sdk-version">
-          <a href="${PUBKY_SDK_URL}" target="_blank" rel="noreferrer">Pubky SDK</a>
-          v${escapeHtml(pubkyPackage.version)}
-        </span>
-        <a href="${PROJECT_URL}" target="_blank" rel="noreferrer">
-          ${githubIcon()} GitHub project ${externalIcon()}
-        </a>
+        <span>Keys stay in this tab and are cleared on reload.</span>
+        <span class="sdk-version"><a href="${PUBKY_SDK_URL}" target="_blank" rel="noreferrer noopener">Pubky SDK</a> v${escapeHtml(pubkyPackage.version)}</span>
+        <a href="${PROJECT_URL}" target="_blank" rel="noreferrer noopener">${githubIcon()} Fork source ${externalIcon()}</a>
       </footer>
     </main>
-    ${localAccessExplanation()}
   `;
-
   attachScanVideo();
-  openLocalAccessExplanation();
 }
 
-function developerBanner() {
+function environmentSwitcher() {
+  const environment = ENVIRONMENTS[state.environment];
   return `
-    <aside class="developer-banner">
-      <span class="banner-icon" aria-hidden="true">${codeIcon()}</span>
-      <div>
-        <strong>Developer tool · local testnet only</strong>
-        <p>
-          This prototype only works while the default Pubky testnet is running on your machine.
-          <a href="${PUBKY_DOCKER_URL}" target="_blank" rel="noreferrer">
-            Start it with Pubky Docker ${externalIcon()}
-          </a>
-        </p>
+    <aside class="environment-panel" aria-label="Environment settings">
+      <div class="environment-switcher" role="group" aria-label="Choose environment">
+        <span class="side-panel-label">Environment</span>
+        ${(["staging", "production"] as const)
+          .map(
+            (id) => `
+          <button type="button" data-environment="${id}" class="environment-option ${state.environment === id ? "active" : ""}" aria-pressed="${String(state.environment === id)}" ${disabledAttr()}>
+            <span class="mode-icon" aria-hidden="true">${keyringIcon()}</span>
+            <strong>${escapeHtml(ENVIRONMENTS[id].label)}</strong>
+          </button>
+        `,
+          )
+          .join("")}
+      </div>
+      <div class="environment-detail">
+        <span class="side-panel-label">Selected homeserver</span>
+        <a href="${escapeHtml(environment.homeserverUrl)}" target="_blank" rel="noreferrer noopener">${escapeHtml(new URL(environment.homeserverUrl).hostname)} ${externalIcon()}</a>
+        <p>Switching environments clears imported keys and pending requests.</p>
+        <button id="reset-session" class="text-button" type="button" ${disabledAttr()}>${trashIcon()} Clear this session</button>
       </div>
     </aside>
   `;
 }
 
-function loginFeedbackView() {
-  const feedback = state.loginFeedback;
-  if (!feedback) return "";
-
-  const icon =
-    feedback.kind === "progress"
-      ? '<span class="login-feedback-spinner" aria-hidden="true"></span>'
-      : feedback.kind === "success"
-        ? checkIcon()
-        : closeIcon();
-
-  return `
-    <div
-      class="login-feedback ${feedback.kind}"
-      role="${feedback.kind === "error" ? "alert" : "status"}"
-      aria-live="${feedback.kind === "error" ? "assertive" : "polite"}"
-    >
-      <span class="login-feedback-icon">${icon}</span>
-      <span>
-        <strong>${escapeHtml(feedback.title)}</strong>
-        ${feedback.detail ? `<small>${escapeHtml(feedback.detail)}</small>` : ""}
-      </span>
-      ${
-        feedback.action
-          ? `
-            <a
-              class="login-feedback-action"
-              href="${escapeHtml(feedback.action.url)}"
-              rel="noreferrer"
-            >${escapeHtml(feedback.action.label)}</a>
-          `
-          : ""
-      }
-    </div>
-  `;
-}
-
-function appHeader(route: Route) {
-  const backHref = appBackHref(route);
-
+function appHeader() {
   return `
     <header class="app-header">
-      ${
-        backHref
-          ? `
-            <a class="app-back" href="${backHref}" aria-label="Go back">
-              ${arrowLeftIcon()}
-            </a>
-          `
-          : ""
-      }
-      <a class="brand" href="#/identities" aria-label="Pubky Ring Simulator home">
-        <img src="${RING_LOGO_URL}" alt="Pubky Ring">
-      </a>
+      ${state.route !== "identities" ? `<button id="go-back" class="app-back" type="button" aria-label="Go back" ${disabledAttr()}>${arrowLeftIcon()}</button>` : ""}
+      <button id="go-home" class="brand" type="button" aria-label="Pubky Ring Simulator home" ${disabledAttr()}>
+        <img src="/pubky-ring-logo.svg" alt="Pubky Ring" width="221" height="48">
+        <span>SIMULATOR</span>
+      </button>
+      <span class="environment-badge ${state.environment}">${escapeHtml(ENVIRONMENTS[state.environment].label)}</span>
     </header>
   `;
 }
 
-function pageForRoute(route: Route) {
-  if (route === "auth") return authPage();
-  if (route === "authorize") return authorizePage();
-  if (route === "rename") return renamePage();
-  if (route === "identity") return identityDetailPage();
+function feedbackView() {
+  if (state.busy)
+    return `<div class="feedback progress" role="status"><span class="spinner" aria-hidden="true"></span><span>${escapeHtml(state.busy)}</span></div>`;
+  const feedback = state.feedback;
+  if (!feedback) return "";
+  return `
+    <div class="feedback ${feedback.kind}" role="${feedback.kind === "error" ? "alert" : "status"}">
+      <span>${escapeHtml(feedback.message)}</span>
+      ${feedback.action ? `<a href="${escapeHtml(feedback.action.url)}" target="_blank" rel="noreferrer noopener">${escapeHtml(feedback.action.label)} ${externalIcon()}</a>` : ""}
+    </div>
+  `;
+}
+
+function pageForRoute() {
+  if (state.route === "import") return importPage();
+  const identity = activeIdentity();
+  if (identity) {
+    if (state.route === "identity") return identityDetailPage(identity);
+    if (state.route === "rename") return renamePage(identity);
+    if (state.route === "authorize") return authorizePage(identity);
+  }
   return identitiesPage();
 }
 
 function identitiesPage() {
   return `
     <section class="screen-section identity-screen">
-      <div class="identity-list">${state.identities.map(identityCard).join("")}</div>
-      <form id="create-identity-form" class="add-pubky-form">
-        <button class="button add-pubky wide" type="submit" ${disabledAttr()}>
-          ${plusIcon()} Add pubky
-        </button>
+      <div class="section-heading"><p class="eyebrow">${escapeHtml(ENVIRONMENTS[state.environment].label)}</p><h1>Your identities</h1></div>
+      ${
+        state.identities.length
+          ? `<div class="identity-list">${state.identities.map(identityCard).join("")}</div>`
+          : `
+        <div class="empty-state">
+          <span class="empty-icon" aria-hidden="true">${keyringIcon()}</span>
+          <h2>Bring an existing pubky</h2>
+          <p>Import its recovery phrase to approve sign-in requests. The identity must already be registered on the selected homeserver.</p>
+        </div>
+      `
+      }
+      <button id="show-import" class="button accent wide" type="button" ${disabledAttr()}>${plusIcon()} Import recovery phrase</button>
+      <p class="helper">Imported keys are held in memory only.</p>
+    </section>
+  `;
+}
+
+function importPage() {
+  return `
+    <section class="screen-section import-screen">
+      <div class="section-heading"><p class="eyebrow">${escapeHtml(ENVIRONMENTS[state.environment].label)}</p><h1>Import an identity</h1></div>
+      <p class="intro">Enter the full recovery phrase for an existing identity. We briefly sign in to ${escapeHtml(new URL(ENVIRONMENTS[state.environment].homeserverUrl).hostname)} to confirm the account exists, then sign out.</p>
+      <form id="import-identity-form" class="stacked-form" autocomplete="off">
+        <label for="recovery-phrase">Recovery phrase</label>
+        <input id="recovery-phrase" name="recovery-phrase" type="password" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" maxlength="512" placeholder="Enter all recovery words, separated by spaces" required ${disabledAttr()}>
+        <p class="helper field-helper">The phrase is cleared from this field as soon as you submit it.</p>
+        <button class="button accent wide" type="submit" ${disabledAttr()}>${checkIcon()} Verify and import</button>
       </form>
     </section>
   `;
 }
 
 function identityCard(identity: SignerIdentity, index: number) {
-  const active = identity.id === state.activeIdentityId;
-
   return `
     <article class="identity-card">
-      <button
-        class="identity-summary"
-        type="button"
-        data-identity-id="${escapeHtml(identity.id)}"
-        aria-pressed="${String(active)}"
-        ${disabledAttr()}
-      >
+      <button class="identity-summary" type="button" data-identity-id="${escapeHtml(identity.id)}" ${disabledAttr()}>
         ${identityAvatar(identity)}
-        <span class="identity-copy">
-          <strong>${escapeHtml(identityName(identity))}</strong>
-          <small>${escapeHtml(overviewPubky(identity.publicKey))}</small>
-        </span>
+        <span class="identity-copy"><strong>${escapeHtml(identityName(identity))}</strong><small>${escapeHtml(shortPubky(identity.publicKey))}</small></span>
         <span class="identity-chevron" aria-hidden="true">&gt;</span>
       </button>
-      <button
-        class="identity-authorize"
-        type="button"
-        data-authorize-identity-id="${escapeHtml(identity.id)}"
-        ${disabledAttr()}
-      >
-        ${scanIcon()} Authorize
-      </button>
+      <button class="identity-authorize" type="button" data-authorize-identity-id="${escapeHtml(identity.id)}" ${disabledAttr()}>${scanIcon()} Authorize</button>
       <span class="identity-number" aria-hidden="true">${String(index + 1).padStart(2, "0")}</span>
     </article>
   `;
 }
 
-function identityDetailPage() {
-  const identity = detailIdentity();
-  if (!identity) return identitiesPage();
-
+function identityDetailPage(identity: SignerIdentity) {
   return `
     <section class="screen-section identity-detail-screen">
       <div class="identity-detail-card">
-        <div class="identity-detail">
-          ${identityAvatar(identity)}
-          <div class="identity-detail-copy">
-            <strong>${escapeHtml(identityName(identity))}</strong>
-            <small>${escapeHtml(identity.publicKey)}</small>
-          </div>
-        </div>
-        <div class="identity-detail-actions">
-          <button
-            class="identity-authorize detail-authorize"
-            type="button"
-            data-authorize-identity-id="${escapeHtml(identity.id)}"
-            ${disabledAttr()}
-          >
-            ${scanIcon()} Authorize
-          </button>
-        </div>
+        ${identityAvatar(identity)}
+        <h1>${escapeHtml(identityName(identity))}</h1>
+        <p class="public-key">${escapeHtml(identity.publicKey)}</p>
+        <span class="verified">${checkIcon()} Registered on ${escapeHtml(ENVIRONMENTS[state.environment].label)}</span>
+        <dl class="request-details"><div><dt>Homeserver</dt><dd><code>${escapeHtml(identity.homeserver)}</code></dd></div></dl>
+        <button class="button accent wide" type="button" data-authorize-identity-id="${escapeHtml(identity.id)}" ${disabledAttr()}>${scanIcon()} Authorize a request</button>
       </div>
       <div class="identity-secondary-actions">
-        <button
-          class="identity-rename"
-          type="button"
-          data-rename-identity-id="${escapeHtml(identity.id)}"
-          ${disabledAttr()}
-        >
-          ${pencilIcon()} Rename
-        </button>
-        <button
-          class="identity-delete"
-          type="button"
-          data-delete-identity-id="${escapeHtml(identity.id)}"
-          ${disabledAttr()}
-        >
-          ${trashIcon()} Delete
-        </button>
+        <button id="rename-identity" class="text-button" type="button" ${disabledAttr()}>${pencilIcon()} Rename</button>
+        <button id="delete-identity" class="text-button destructive" type="button" ${disabledAttr()}>${trashIcon()} Remove key</button>
       </div>
     </section>
   `;
 }
 
-function renamePage() {
-  const identity = renameIdentity();
-  if (!identity) return identitiesPage();
-
+function renamePage(identity: SignerIdentity) {
   return `
     <section class="screen-section rename-screen">
-      <div class="rename-heading">
-        <h1>Rename</h1>
-      </div>
-
-      <div class="rename-identity">
-        ${identityAvatar(identity)}
-      </div>
-
-      <form id="rename-form" class="rename-form">
-        <label>
-          Identity name
-          <input
-            name="name"
-            type="text"
-            value="${escapeHtml(identityName(identity))}"
-            maxlength="40"
-            autocomplete="off"
-            required
-            autofocus
-          >
-        </label>
-        <button class="button accent wide rename-save" type="submit" ${disabledAttr()}>
-          Save
-        </button>
+      <div class="section-heading"><h1>Rename identity</h1></div>
+      ${identityAvatar(identity)}
+      <form id="rename-form" class="stacked-form">
+        <label for="identity-name">Identity name</label>
+        <input id="identity-name" name="name" type="text" value="${escapeHtml(identityName(identity))}" maxlength="40" autocomplete="off" required ${disabledAttr()}>
+        <button class="button accent wide" type="submit" ${disabledAttr()}>Save</button>
       </form>
     </section>
   `;
 }
 
-function authorizePage() {
-  const identity = authorizeIdentity();
-  if (!identity) return identitiesPage();
-
+function authorizePage(identity: SignerIdentity) {
   return `
     <section class="screen-section regular-authorize-screen">
-      <div class="authorize-heading">
-        <h1>Authorize</h1>
-      </div>
-
-      <div class="authorize-identity">
-        ${identityAvatar(identity)}
-        <div>
-          <strong>${escapeHtml(identityName(identity))}</strong>
-          <small>${escapeHtml(shortPubky(identity.publicKey))}</small>
-        </div>
-      </div>
-
+      <div class="section-heading"><h1>${state.authRequest ? "Review sign-in" : "Authorize"}</h1></div>
+      <div class="authorize-identity">${identityAvatar(identity)}<div><strong>${escapeHtml(identityName(identity))}</strong><small>${escapeHtml(identity.publicKey)}</small></div></div>
       ${state.authRequest ? authRequestPreview(state.authRequest) : authorizeSources()}
     </section>
   `;
 }
 
 function authorizeSources() {
+  const cameraAvailable = Boolean(
+    window.BarcodeDetector && navigator.mediaDevices?.getUserMedia,
+  );
   return `
-    <div class="authorize-actions">
-      <button id="paste-authorize-link" class="button authorize-source wide" type="button" ${disabledAttr()}>
-        ${clipboardIcon()} Paste link
-      </button>
-      <div class="authorize-divider"><span>or</span></div>
-
-      ${
-        state.scanActive
-          ? `
-            <button id="stop-scan" class="button authorize-source wide" type="button">
-              ${closeIcon()} Stop camera
-            </button>
-            ${captureView()}
-          `
-          : `
-            <button id="start-authorize-scan" class="button authorize-source wide" type="button" ${disabledAttr()}>
-              ${scanIcon()} Use camera
-            </button>
-          `
-      }
-      ${state.error ? `<p class="authorize-error">${escapeHtml(state.error)}</p>` : ""}
-    </div>
+    <form id="preview-auth-form" class="stacked-form">
+      <label for="auth-link">Approval link</label>
+      <textarea id="auth-link" name="auth" rows="4" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="${MAX_AUTH_LINK_LENGTH}" placeholder="Paste the pubkyauth:// link from your app" required ${disabledAttr()}></textarea>
+      <button class="button accent wide" type="submit" ${disabledAttr()}>Preview request</button>
+      <button id="paste-authorize-link" class="button secondary wide" type="button" ${disabledAttr()}>${clipboardIcon()} Paste from clipboard</button>
+    </form>
+    <p class="helper">Preview the pasted link or scan a QR code to review permissions. Approval requires a separate click.</p>
+    ${
+      state.scanActive
+        ? `
+      <div class="capture-view"><video id="scan-video" autoplay muted playsinline aria-label="Camera QR scanner"></video><span>Looking for an approval QR code</span></div>
+      <button id="stop-scan" class="button secondary wide" type="button">${closeIcon()} Stop camera</button>
+    `
+        : `
+      <button id="start-scan" class="button secondary wide" type="button" ${disabledAttr(!cameraAvailable)}>${scanIcon()} Scan with camera</button>
+      ${!cameraAvailable ? '<p class="helper">Camera QR scanning is unavailable in this browser. Paste the approval link above.</p>' : ""}
+    `
+    }
   `;
 }
 
 function authRequestPreview(request: AuthRequestPreview) {
   const source = request.xCallback?.xSource;
-  const permissions = request.capabilities.length
-    ? request.capabilities.map(permissionPreview).join("")
-    : '<p class="muted">No storage permissions requested.</p>';
-
   return `
     <div class="request-preview">
-      <div class="section-title">
-        <div>
-          <p class="eyebrow">
-            ${request.authMode === "grant" ? "Grant-based auth" : "Cookie-based auth"}
-          </p>
-          <h2>${request.kind === "signin" ? "Sign in request" : "Sign up request"}</h2>
-        </div>
-        <span class="verified">${checkIcon()} Parsed</span>
-      </div>
-      ${
-        source
-          ? `<p class="request-source">App label <strong>${escapeHtml(source)}</strong></p>`
-          : ""
-      }
-      ${
-        request.clientId
-          ? `<p class="request-client-id">Client ID <code>${escapeHtml(request.clientId)}</code></p>`
-          : ""
-      }
-      ${
-        request.homeserver
-          ? `<p class="muted">Homeserver: ${escapeHtml(shortPubky(request.homeserver))}</p>`
-          : ""
-      }
-      <div class="permission-list">${permissions}</div>
+      <p class="eyebrow">${request.authMode === "grant" ? "Grant-based sign-in" : "Cookie-based sign-in"}</p>
+      <dl class="request-details">
+        <div><dt>Environment</dt><dd>${escapeHtml(ENVIRONMENTS[state.environment].label)}</dd></div>
+        <div><dt>App label <small>(provided by app)</small></dt><dd>${source ? escapeHtml(source) : "Not provided"}</dd></div>
+        <div><dt>Client ID</dt><dd><code>${request.clientId ? escapeHtml(request.clientId) : "Not provided by this request"}</code></dd></div>
+        <div><dt>Approval relay</dt><dd>${escapeHtml(request.relay)}</dd></div>
+      </dl>
+      <div class="permission-list"><h2>Requested access</h2>${request.capabilities.length ? request.capabilities.map(permissionPreview).join("") : '<p class="muted">No storage permissions requested.</p>'}</div>
       <div class="request-actions">
-        <button id="approve-auth-request" class="button accent wide" type="button" ${disabledAttr()}>
-          ${checkIcon()} Authorize
-        </button>
-        <button id="cancel-auth-request" class="button authorize-source wide" type="button" ${disabledAttr()}>
-          Cancel
-        </button>
+        <button id="approve-auth-request" class="button accent wide" type="button" ${disabledAttr()}>${checkIcon()} Approve sign-in</button>
+        <button id="cancel-auth-request" class="button secondary wide" type="button" ${disabledAttr()}>Cancel</button>
       </div>
-      ${state.error ? `<p class="authorize-error">${escapeHtml(state.error)}</p>` : ""}
     </div>
   `;
 }
@@ -508,367 +338,69 @@ function permissionPreview(capability: string) {
   const scope = separator >= 0 ? capability.slice(0, separator) : capability;
   const actions = separator >= 0 ? capability.slice(separator + 1) : "";
   const access =
-    actions === "rw" ? "Read and write" : actions === "r" ? "Read" : "Write";
-  const target = scope.endsWith("/") ? "Directory" : "Exact path";
-
-  return `
-    <div class="permission">
-      <span>${folderIcon()}</span>
-      <code title="${escapeHtml(scope)}">${escapeHtml(scope)}</code>
-      <small>${target} · ${access}</small>
-    </div>
-  `;
-}
-
-function authPage() {
-  return `
-    <section class="screen-section shortcut-auth-screen">
-      <label class="shortcut-auth-field">
-        <span>Auth link</span>
-        <textarea
-          id="shortcut-auth-input"
-          class="shortcut-auth-input"
-          name="auth"
-          rows="7"
-          autocapitalize="none"
-          autocomplete="off"
-          spellcheck="false"
-          placeholder="Paste Auth link"
-          autofocus
-          ${disabledAttr()}
-        >${escapeHtml(state.authInput)}</textarea>
-      </label>
-    </section>
-  `;
-}
-
-function captureView() {
-  const label =
-    state.scanSource === "camera"
-      ? "Looking for a QR code with the camera"
-      : "Looking for a QR code on screen";
-
-  return `
-    <div class="capture-view">
-      <video id="scan-video" autoplay muted playsinline></video>
-      <span><i></i> ${label}</span>
-    </div>
-  `;
-}
-
-
-function modeSwitcher(route: Route) {
-  const regularActive = route !== "auth";
-
-  return `
-    <nav class="mode-switcher" aria-label="Simulator mode">
-      <span class="side-panel-label">Choose mode</span>
-      <a
-        href="#/identities"
-        class="${regularActive ? "active" : ""}"
-        ${regularActive ? 'aria-current="page"' : ""}
-      >
-        <span class="mode-icon" aria-hidden="true">${keyringIcon()}</span>
-        <span class="mode-copy">
-          <strong>Regular</strong>
-        </span>
-      </a>
-      <a
-        href="#/auth"
-        class="shortcut ${route === "auth" ? "active" : ""}"
-        ${route === "auth" ? 'aria-current="page"' : ""}
-      >
-        <span class="mode-icon" aria-hidden="true">${boltIcon()}</span>
-        <span class="mode-copy">
-          <strong>Shortcut</strong>
-        </span>
-      </a>
-    </nav>
-  `;
-}
-
-function localServicesPanel() {
-  return `
-    <aside class="local-services-panel" aria-label="Local testnet service status">
-      <header>
-        <strong>Access to local testnet</strong>
-      </header>
-      <ul aria-live="polite">
-        ${LOCAL_SERVICES.map(localServiceRow).join("")}
-      </ul>
-    </aside>
-  `;
-}
-
-function localAccessExplanation() {
-  if (!state.localAccessExplanationVisible) return "";
-
-  return `
-    <dialog
-      id="local-access-dialog"
-      class="local-access-dialog"
-      aria-labelledby="local-access-title"
-      aria-describedby="local-access-description local-access-note"
-    >
-      <h2 id="local-access-title">Allow access to localhost</h2>
-      <p id="local-access-description" class="local-access-description">
-        Your browser requires access to the testnet services running on your machine.
-      </p>
-      <p id="local-access-note" class="local-access-note">
-        <a href="${PROJECT_URL}" target="_blank" rel="noreferrer">Run the simulator locally</a>
-        to avoid granting an additional browser permission.
-      </p>
-      <button
-        id="continue-local-access"
-        class="button accent wide"
-        type="button"
-        autofocus
-      >
-        Prompt permission
-      </button>
-    </dialog>
-  `;
-}
-
-function openLocalAccessExplanation() {
-  const dialog = document.querySelector<HTMLDialogElement>(
-    "#local-access-dialog",
-  );
-  if (dialog && !dialog.open) dialog.showModal();
-}
-
-function localServiceRow(service: LocalService) {
-  const access = state.localServiceAccess[service.port] || "checking";
-  const label =
-    access === "accessible"
-      ? "Reachable"
-      : access === "failed"
-        ? "No response"
-        : access === "waiting"
-          ? "Waiting for access"
-          : "Checking";
-
-  return `
-    <li class="${access}">
-      <div class="local-service-title">
-        <strong>${escapeHtml(service.name)}</strong>
-        <span class="local-service-port">:${service.port}</span>
-      </div>
-      <small>${escapeHtml(service.purpose)}</small>
-      <span class="local-service-access">
-        <i aria-hidden="true"></i>
-        ${label}
-      </span>
-    </li>
-  `;
-}
-
-async function initializeLocalServiceAccess() {
-  if (isLoopbackHost(window.location.hostname)) {
-    localServiceProbeEnabled = true;
-    void probeLocalServices();
-    return;
-  }
-
-  localServicePermissionStatus = await queryLoopbackPermission();
-
-  if (!localServicePermissionStatus) {
-    localServiceProbeEnabled = true;
-    void probeLocalServices();
-    return;
-  }
-
-  localServicePermissionStatus.addEventListener(
-    "change",
-    handleLocalServicePermissionChange,
-  );
-  applyLocalServicePermission(localServicePermissionStatus.state);
-}
-
-function isLoopbackHost(hostname: string) {
-  const normalizedHostname = hostname
-    .toLowerCase()
-    .replace(/^\[(.*)\]$/, "$1")
-    .replace(/\.$/, "");
-
-  return (
-    normalizedHostname === "localhost" ||
-    normalizedHostname.endsWith(".localhost") ||
-    normalizedHostname === "::1" ||
-    /^127(?:\.\d{1,3}){3}$/.test(normalizedHostname)
-  );
-}
-
-async function queryLoopbackPermission() {
-  if (!navigator.permissions?.query || !window.isSecureContext)
-    return undefined;
-
-  const permissionNames = [
-    "loopback-network",
-    "local-network-access",
-  ] as const;
-
-  for (const name of permissionNames) {
-    try {
-      return await navigator.permissions.query({
-        name,
-      } as unknown as PermissionDescriptor);
-    } catch {
-      // Try the legacy permission name before treating the API as unsupported.
-    }
-  }
-
-  return undefined;
-}
-
-function handleLocalServicePermissionChange() {
-  if (localServicePermissionStatus)
-    applyLocalServicePermission(localServicePermissionStatus.state);
-}
-
-function applyLocalServicePermission(permissionState: PermissionState) {
-  if (permissionState === "prompt") {
-    localServiceProbeEnabled = false;
-    state.localAccessExplanationVisible = true;
-    setLocalServiceAccess("waiting");
-    render();
-    return;
-  }
-
-  if (permissionState === "denied") {
-    localServiceProbeEnabled = false;
-    setLocalServiceAccess("failed");
-    render();
-    return;
-  }
-
-  state.localAccessExplanationVisible = false;
-  localServiceProbeEnabled = true;
-  setLocalServiceAccess("checking");
-  render();
-  void probeLocalServices();
-}
-
-function setLocalServiceAccess(access: LocalServiceAccess) {
-  LOCAL_SERVICES.forEach((service) => {
-    state.localServiceAccess[service.port] = access;
-  });
-}
-
-async function probeLocalServices() {
-  if (
-    !localServiceProbeEnabled ||
-    localServiceProbeActive ||
-    document.visibilityState === "hidden"
-  )
-    return;
-  localServiceProbeActive = true;
-
-  try {
-    await Promise.all(
-      LOCAL_SERVICES.map(async (service) => {
-        state.localServiceAccess[service.port] =
-          await probeLocalService(service);
-        refreshLocalServicesPanel();
-      }),
-    );
-  } finally {
-    localServiceProbeActive = false;
-    localServicePermissionPromptPending = false;
-    if (state.localAccessExplanationVisible) {
-      if (localServicePermissionStatus?.state === "granted")
-        state.localAccessExplanationVisible = false;
-      render();
-    }
-  }
-}
-
-async function probeLocalService(service: LocalService) {
-  const controller = new AbortController();
-  const timeout = window.setTimeout(
-    () => controller.abort(),
-    localServicePermissionPromptPending ? 30_000 : 4_000,
-  );
-
-  try {
-    await fetch(service.url, {
-      cache: "no-store",
-      credentials: "omit",
-      signal: controller.signal,
-    });
-    return "accessible" as const;
-  } catch {
-    return "failed" as const;
-  } finally {
-    window.clearTimeout(timeout);
-  }
-}
-
-function refreshLocalServicesPanel() {
-  const panel = document.querySelector<HTMLElement>(".local-services-panel");
-  if (panel) panel.outerHTML = localServicesPanel();
+    actions === "rw"
+      ? "Read and write"
+      : actions === "r"
+        ? "Read"
+        : actions === "w"
+          ? "Write"
+          : actions || "Unspecified";
+  return `<div class="permission"><span aria-hidden="true">${folderIcon()}</span><code>${escapeHtml(scope)}</code><small>${scope.endsWith("/") ? "Directory" : "Exact path"} · ${escapeHtml(access)}</small></div>`;
 }
 
 function handleClick(event: MouseEvent) {
-  const target = event.target;
-  if (!(target instanceof Element)) return;
+  if (!(event.target instanceof Element)) return;
+  const button = event.target.closest<HTMLButtonElement>("button");
+  if (!button || button.disabled || state.busy) return;
 
-  const authorizeButton = target.closest<HTMLButtonElement>(
-    "[data-authorize-identity-id]",
-  );
-  if (authorizeButton?.dataset.authorizeIdentityId) {
-    setActiveIdentityId(authorizeButton.dataset.authorizeIdentityId);
-    state.authInput = "";
-    state.authRequest = undefined;
-    clearStatus();
-    window.location.hash = authorizeHref(
-      authorizeButton.dataset.authorizeIdentityId,
-    );
+  const environment = button.dataset.environment;
+  if (environment === "staging" || environment === "production") {
+    if (environment !== state.environment) {
+      clearSession();
+      state.environment = environment;
+      state.feedback = {
+        kind: "notice",
+        message: `Switched to ${ENVIRONMENTS[environment].label}. Import an identity to continue.`,
+      };
+      render();
+    }
     return;
   }
-
-  const deleteButton = target.closest<HTMLButtonElement>(
-    "[data-delete-identity-id]",
-  );
-  if (deleteButton?.dataset.deleteIdentityId) {
-    deleteIdentity(deleteButton.dataset.deleteIdentityId);
+  if (button.dataset.authorizeIdentityId) {
+    navigate("authorize", button.dataset.authorizeIdentityId);
     return;
   }
-
-  const renameButton = target.closest<HTMLButtonElement>(
-    "[data-rename-identity-id]",
-  );
-  if (renameButton?.dataset.renameIdentityId) {
-    setActiveIdentityId(renameButton.dataset.renameIdentityId);
-    clearStatus();
-    window.location.hash = renameHref(renameButton.dataset.renameIdentityId);
+  if (button.dataset.identityId) {
+    navigate("identity", button.dataset.identityId);
     return;
   }
-
-  const identityButton =
-    target.closest<HTMLButtonElement>("[data-identity-id]");
-  if (identityButton?.dataset.identityId) {
-    setActiveIdentityId(identityButton.dataset.identityId);
-    clearStatus();
-    window.location.hash = identityDetailHref(identityButton.dataset.identityId);
-    return;
-  }
-
-  const button = target.closest<HTMLButtonElement>("button");
-  if (!button || button.disabled) return;
-
   switch (button.id) {
-    case "continue-local-access":
-      localServiceProbeEnabled = true;
-      localServicePermissionPromptPending = true;
-      setLocalServiceAccess("checking");
-      button.disabled = true;
-      button.textContent = "Waiting for permission…";
-      refreshLocalServicesPanel();
-      void probeLocalServices();
+    case "go-home":
+      navigate("identities");
       break;
-    case "start-authorize-scan":
-      void handleStartScan("camera");
+    case "go-back":
+      navigate(
+        state.route === "authorize" || state.route === "rename"
+          ? "identity"
+          : "identities",
+      );
+      break;
+    case "show-import":
+      navigate("import");
+      break;
+    case "rename-identity":
+      navigate("rename");
+      break;
+    case "delete-identity":
+      deleteActiveIdentity();
+      break;
+    case "reset-session":
+      clearSession();
+      state.feedback = {
+        kind: "notice",
+        message: "Session cleared. All imported keys have been removed.",
+      };
+      render();
       break;
     case "paste-authorize-link":
       void handlePasteAuthorizeLink();
@@ -879,639 +411,413 @@ function handleClick(event: MouseEvent) {
     case "cancel-auth-request":
       handleCancelAuthRequest();
       break;
+    case "start-scan":
+      void handleStartScan();
+      break;
     case "stop-scan":
-      stopScanCapture("QR capture stopped.");
+      stopScanCapture();
+      render();
       break;
   }
-}
-
-function handleDialogCancel(event: Event) {
-  if (
-    event.target instanceof HTMLDialogElement &&
-    event.target.id === "local-access-dialog"
-  )
-    event.preventDefault();
 }
 
 function handleSubmit(event: SubmitEvent) {
   const form = event.target;
   if (!(form instanceof HTMLFormElement)) return;
-
   event.preventDefault();
   if (state.busy) return;
-
-  switch (form.id) {
-    case "create-identity-form":
-      void handleCreateIdentity();
-      break;
-    case "rename-form":
-      handleRename(form);
-      break;
+  if (form.id === "import-identity-form") void handleImportIdentity(form);
+  if (form.id === "rename-form") handleRename(form);
+  if (form.id === "preview-auth-form") {
+    const input = form.querySelector<HTMLTextAreaElement>("#auth-link");
+    if (!input) return;
+    let value = input.value;
+    input.value = "";
+    previewAuthInput(value);
+    value = "";
   }
 }
 
-function handleInput(event: Event) {
-  const input = event.target;
-  if (!(input instanceof HTMLTextAreaElement)) return;
-  if (input.id !== "shortcut-auth-input") return;
-
-  state.authInput = input.value;
-  state.authRequest = undefined;
-
-  if (
-    event instanceof InputEvent &&
-    event.inputType === "insertFromPaste" &&
-    input.value.trim() &&
-    !state.busy
-  ) {
-    void handleQuickAuth(input.value);
+async function handleImportIdentity(form: HTMLFormElement) {
+  const input = form.querySelector<HTMLInputElement>("#recovery-phrase");
+  if (!input) return;
+  let phrase = input.value;
+  input.value = "";
+  const epoch = sessionEpoch;
+  const environment = state.environment;
+  state.feedback = undefined;
+  state.busy = `Checking registration on ${ENVIRONMENTS[environment].label}…`;
+  render();
+  try {
+    const pending = importIdentity(phrase, environment);
+    phrase = "";
+    const identity = await pending;
+    if (sessionEpoch !== epoch || state.environment !== environment) {
+      disposeIdentity(identity);
+      return;
+    }
+    const existing = state.identities.find((item) => item.id === identity.id);
+    if (existing) {
+      disposeIdentity(identity);
+      state.activeIdentityId = existing.id;
+      state.feedback = {
+        kind: "notice",
+        message: "This identity is already imported.",
+      };
+    } else {
+      state.identities.push(identity);
+      state.activeIdentityId = identity.id;
+      state.feedback = {
+        kind: "success",
+        message: `Identity verified on ${ENVIRONMENTS[environment].label}.`,
+      };
+    }
+    state.route = "identity";
+  } catch (error) {
+    if (sessionEpoch === epoch)
+      setCoreError(error, "Could not verify this recovery phrase. Try again.");
+  } finally {
+    phrase = "";
+    if (sessionEpoch === epoch) {
+      state.busy = undefined;
+      render();
+    }
   }
-}
-
-function handlePaste(event: ClipboardEvent) {
-  const input = event.target;
-  if (!(input instanceof HTMLTextAreaElement)) return;
-  if (input.id !== "shortcut-auth-input" || state.busy) return;
-
-  const authLink = event.clipboardData?.getData("text").trim();
-  if (!authLink) return;
-
-  event.preventDefault();
-  input.value = authLink;
-  state.authInput = authLink;
-  state.authRequest = undefined;
-  void handleQuickAuth(authLink);
-}
-
-async function handleCreateIdentity() {
-  await run("Creating a fresh test identity…", async () => {
-    const identity = createIdentity();
-    setActiveIdentity(identity);
-    updateBusy("Registering it on your local testnet…");
-    setActiveIdentity(await signUpIdentity(identity));
-    setNotice(`${identityName(identity)} is ready.`);
-  });
 }
 
 function handleRename(form: HTMLFormElement) {
-  const identity = renameIdentity();
-  if (!identity) return;
-
-  const name = formValue(new FormData(form), "name").trim();
-  if (!name) return;
-
+  const identity = activeIdentity();
+  const input = form.querySelector<HTMLInputElement>("#identity-name");
+  const name = input?.value.trim().slice(0, 40);
+  if (!identity || !name) return;
   state.identityNames[identity.id] = name;
-  clearStatus();
-  window.location.hash = identityDetailHref(identity.id);
-}
-
-async function handleQuickAuth(authLink: string) {
-  state.authInput = authLink;
-  beginLoginFeedback("Signing in…");
-  let request: AuthRequestPreview | undefined;
-
-  await run("Checking the local auth request…", async () => {
-    request = assertSupportedAuthRequest(
-      parseAuthRequest(state.authInput),
-    );
-    state.authRequest = request;
-    beginLoginFeedback("Signing in…", authRequestSummary(request));
-    const identity = await identityForQuickAuth();
-
-    updateBusy(`Signing in as ${identityName(identity)}…`);
-    await approveAuthRequest(identity, request.url);
-    state.approvals = [
-      {
-        at: new Date().toISOString(),
-        capabilities: request.capabilities,
-        publicKey: identity.publicKey,
-      },
-      ...state.approvals,
-    ].slice(0, 5);
-    setNotice(`Signed in as ${identityName(identity)}.`);
-  });
-
-  if (state.error) {
-    showLoginFeedback(
-      "Login failed",
-      "error",
-      state.error,
-      feedbackAction(request, "error"),
-    );
-  } else {
-    state.authInput = "";
-    state.authRequest = undefined;
-    showLoginFeedback(
-      "Logged in",
-      "success",
-      request ? authRequestSummary(request) : undefined,
-      feedbackAction(request, "success"),
-    );
-  }
+  navigate("identity");
 }
 
 async function handlePasteAuthorizeLink() {
+  const input = app.querySelector<HTMLTextAreaElement>("#auth-link");
+  if (!input) return;
   if (!navigator.clipboard?.readText) {
-    setError("Clipboard access is not available in this browser.");
+    state.feedback = {
+      kind: "notice",
+      message:
+        "Use your browser’s Paste command in the approval link field, then choose Preview request.",
+    };
     render();
     return;
   }
-
+  const epoch = sessionEpoch;
   try {
-    const input = await navigator.clipboard.readText();
-    if (!input.trim()) throw new Error("The clipboard does not contain a link.");
-    await handleAuthorizeInput(input);
-  } catch (error) {
-    setError(error);
+    let value = await navigator.clipboard.readText();
+    if (sessionEpoch !== epoch || !input.isConnected || state.busy) return;
+    if (!value.trim() || value.length > MAX_AUTH_LINK_LENGTH) {
+      value = "";
+      state.feedback = {
+        kind: "error",
+        message:
+          "The clipboard does not contain a supported approval link. Paste a fresh link into the field.",
+      };
+      render();
+      return;
+    }
+    input.value = value;
+    value = "";
+    input.focus();
+  } catch {
+    if (sessionEpoch !== epoch || !input.isConnected) return;
+    state.feedback = {
+      kind: "notice",
+      message:
+        "Clipboard access was unavailable. Paste into the approval link field, then choose Preview request.",
+    };
     render();
   }
 }
 
-async function handleAuthorizeInput(input: string) {
-  state.authInput = input;
-  clearStatus();
-
+function previewAuthInput(input: string) {
+  if (state.busy || state.route !== "authorize" || !activeIdentity()) return;
+  stopScanCapture();
+  clearSensitiveFields();
+  state.feedback = undefined;
+  state.authRequest = undefined;
   try {
-    const request = assertLocalAuthRequest(parseAuthRequest(state.authInput));
-    state.authRequest = request;
+    state.authRequest = parseAuthRequest(input, state.environment);
   } catch (error) {
-    state.authRequest = undefined;
-    setError(error);
+    setCoreError(
+      error,
+      "This approval link is invalid for the selected environment.",
+    );
+  } finally {
+    input = "";
   }
-
   render();
 }
 
 async function handleApproveAuthRequest() {
-  const identity = authorizeIdentity();
+  const identity = activeIdentity();
   const request = state.authRequest;
-  if (!identity || !request) return;
-
-  beginLoginFeedback("Approving auth request…", authRequestSummary(request));
-
-  await run("Approving auth request…", async () => {
-    const readyIdentity = await signUpIdentity(identity);
-    setActiveIdentity(readyIdentity);
-    await approveAuthRequest(readyIdentity, request.url);
-    state.approvals = [
-      {
-        at: new Date().toISOString(),
-        capabilities: request.capabilities,
-        publicKey: readyIdentity.publicKey,
-      },
-      ...state.approvals,
-    ].slice(0, 5);
-    setNotice(`Authorized with ${identityName(readyIdentity)}.`);
-  });
-
-  if (state.error) {
-    showLoginFeedback(
-      "Authorization failed",
-      "error",
-      state.error,
-      feedbackAction(request, "error"),
+  if (!identity || !request || state.busy) return;
+  const epoch = sessionEpoch;
+  const environment = state.environment;
+  const isCurrent = () =>
+    sessionEpoch === epoch &&
+    state.environment === environment &&
+    activeIdentity() === identity &&
+    state.authRequest === request;
+  state.busy = "Approving sign-in…";
+  state.feedback = undefined;
+  render();
+  try {
+    await approveAuthRequest(identity, request.url, environment, isCurrent);
+    if (!isCurrent()) return;
+    state.feedback = {
+      kind: "success",
+      message: `Sign-in approved with ${identityName(identity)}.`,
+      action: feedbackAction(request, "success"),
+    };
+    state.route = "identity";
+  } catch (error) {
+    if (!isCurrent()) return;
+    setCoreError(
+      error,
+      "Could not approve this request. Paste a fresh link to try again.",
     );
-    return;
+    if (state.feedback)
+      state.feedback.action = feedbackAction(request, "error");
+  } finally {
+    if (sessionEpoch === epoch) {
+      state.authRequest = undefined;
+      state.busy = undefined;
+      clearSensitiveFields();
+      render();
+    }
   }
-
-  state.authInput = "";
-  state.authRequest = undefined;
-  showLoginFeedback(
-    "Authorized",
-    "success",
-    authRequestSummary(request),
-    feedbackAction(request, "success"),
-  );
-  window.location.hash = identityDetailHref(identity.id);
 }
 
 function handleCancelAuthRequest() {
-  const identity = authorizeIdentity();
   const request = state.authRequest;
-  if (!identity || !request) return;
-
-  state.authInput = "";
-  state.authRequest = undefined;
-  clearStatus();
-  showLoginFeedback(
-    "Authorization cancelled",
-    "cancel",
-    authRequestSummary(request),
-    feedbackAction(request, "cancel"),
-  );
-  window.location.hash = identityDetailHref(identity.id);
+  if (!request || state.busy) return;
+  const action = feedbackAction(request, "cancel");
+  navigate("identity");
+  state.feedback = {
+    kind: "notice",
+    message: "Authorization cancelled.",
+    action,
+  };
+  render();
 }
 
-async function identityForQuickAuth() {
-  const active = activeIdentity();
-  const readyIdentity =
-    active && isIdentityReady(active)
-      ? active
-      : state.identities.find(isIdentityReady);
-
-  if (readyIdentity) {
-    setActiveIdentityId(readyIdentity.id);
-    updateBusy("Checking the active identity…");
-    const verifiedIdentity = await signUpIdentity(readyIdentity);
-    setActiveIdentity(verifiedIdentity);
-    return verifiedIdentity;
-  }
-
-  const identity = active || createIdentity();
-  setActiveIdentity(identity);
-  updateBusy(
-    active ? "Finishing identity setup…" : "Creating your first test identity…",
-  );
-  const signedUpIdentity = await signUpIdentity(identity);
-  setActiveIdentity(signedUpIdentity);
-  return signedUpIdentity;
-}
-
-async function handleStartScan(label: "camera" | "screen") {
-  if (!window.BarcodeDetector) {
-    setError(
-      "Screen QR scanning needs Chrome or Edge. You can paste the auth link instead.",
-    );
-    render();
-    return;
-  }
-
-  if (!navigator.mediaDevices?.getDisplayMedia) {
-    setError("Screen capture is not available in this browser.");
-    render();
-    return;
-  }
-
-  const BarcodeDetector = window.BarcodeDetector;
-
-  await run("Starting screen capture…", async () => {
-    const detector = new BarcodeDetector({ formats: ["qr_code"] });
-    const stream = await navigator.mediaDevices.getDisplayMedia({
+async function handleStartScan() {
+  if (!window.BarcodeDetector || !navigator.mediaDevices?.getUserMedia) return;
+  const epoch = sessionEpoch;
+  const captureEpoch = ++scanEpoch;
+  state.feedback = undefined;
+  state.busy = "Waiting for camera access…";
+  render();
+  try {
+    const detector = new window.BarcodeDetector({ formats: ["qr_code"] });
+    const stream = await navigator.mediaDevices.getUserMedia({
       audio: false,
-      video: { frameRate: { ideal: 8, max: 12 } },
+      video: { facingMode: { ideal: "environment" } },
     });
-    stream.getVideoTracks().forEach((track) => {
-      track.addEventListener("ended", () => {
-        stopScanCapture("Screen capture ended.");
-      });
-    });
+    if (
+      sessionEpoch !== epoch ||
+      scanEpoch !== captureEpoch ||
+      state.route !== "authorize" ||
+      document.visibilityState === "hidden"
+    ) {
+      stream.getTracks().forEach((track) => track.stop());
+      return;
+    }
     scanDetector = detector;
     scanStream = stream;
     state.scanActive = true;
-    state.scanSource = label;
-    clearStatus();
-  });
-
-  if (state.scanActive) queueScan();
+    stream.getVideoTracks().forEach((track) => {
+      track.addEventListener("ended", () => {
+        if (scanStream !== stream) return;
+        stopScanCapture();
+        render();
+      });
+    });
+  } catch {
+    if (sessionEpoch === epoch)
+      state.feedback = {
+        kind: "error",
+        message:
+          "Could not open the camera. Paste the approval link to continue.",
+      };
+  } finally {
+    if (sessionEpoch === epoch) {
+      state.busy = undefined;
+      render();
+      if (state.scanActive) queueScan(captureEpoch);
+    }
+  }
 }
 
 function attachScanVideo() {
-  const video = document.querySelector<HTMLVideoElement>("#scan-video");
-  if (!video || !scanStream) return;
-
-  if (video.srcObject !== scanStream) video.srcObject = scanStream;
-  void video.play().catch((error: unknown) => {
-    if (!state.scanActive) return;
-    setError(error);
+  const video = app.querySelector<HTMLVideoElement>("#scan-video");
+  const stream = scanStream;
+  if (!video || !stream) return;
+  video.srcObject = stream;
+  void video.play().catch(() => {
+    if (scanStream !== stream) return;
     stopScanCapture();
+    state.feedback = {
+      kind: "error",
+      message: "Camera playback failed. Paste the approval link to continue.",
+    };
+    render();
   });
 }
 
-function queueScan() {
+function queueScan(epoch: number) {
   window.clearTimeout(scanTimer);
-  scanTimer = window.setTimeout(() => {
-    void scanScreenFrame();
-  }, 250);
+  scanTimer = window.setTimeout(() => void scanCameraFrame(epoch), 250);
 }
 
-async function scanScreenFrame() {
-  if (!state.scanActive || !scanDetector) return;
-
-  const video = document.querySelector<HTMLVideoElement>("#scan-video");
-  if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-    queueScan();
+async function scanCameraFrame(epoch: number) {
+  const detector = scanDetector;
+  if (!state.scanActive || !detector || epoch !== scanEpoch) return;
+  const video = app.querySelector<HTMLVideoElement>("#scan-video");
+  if (
+    !video ||
+    video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+    !video.videoWidth
+  ) {
+    queueScan(epoch);
     return;
   }
-
   try {
-    const rawValue = await detectQrValue(video);
-    if (!state.scanActive) return;
-
-    if (!rawValue) {
-      queueScan();
+    const canvas = scanCanvas || document.createElement("canvas");
+    scanCanvas = canvas;
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("No canvas context");
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const barcodes = await detector.detect(canvas);
+    if (!state.scanActive || epoch !== scanEpoch) return;
+    const value = barcodes.find((barcode) => barcode.rawValue)?.rawValue;
+    if (value) {
+      previewAuthInput(value);
       return;
     }
-
-    if (currentRoute() === "authorize") {
-      stopScanCapture("Local auth QR found.");
-      void handleAuthorizeInput(rawValue);
-      return;
-    }
-
-    state.authInput = rawValue;
-    state.authRequest = assertSupportedAuthRequest(
-      parseAuthRequest(rawValue),
-    );
-    stopScanCapture("Local auth QR found.");
-  } catch (error) {
-    if (!state.scanActive) return;
-    setError(error);
+    queueScan(epoch);
+  } catch {
+    if (!state.scanActive || epoch !== scanEpoch) return;
     stopScanCapture();
+    state.feedback = {
+      kind: "error",
+      message:
+        "Could not read this QR code. Paste the approval link to continue.",
+    };
+    render();
   }
 }
 
-async function detectQrValue(video: HTMLVideoElement) {
-  if (!scanDetector || !video.videoWidth || !video.videoHeight)
-    return undefined;
-
-  const canvas = scanCanvas || document.createElement("canvas");
-  scanCanvas = canvas;
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-
-  const context = canvas.getContext("2d");
-  if (!context) throw new Error("Could not read the QR capture frame.");
-
-  context.drawImage(video, 0, 0, canvas.width, canvas.height);
-  const barcodes = await scanDetector.detect(canvas);
-  return barcodes.find((barcode) => barcode.rawValue)?.rawValue;
-}
-
-function stopScanCapture(notice?: string) {
+function stopScanCapture() {
+  ++scanEpoch;
   window.clearTimeout(scanTimer);
   scanTimer = undefined;
-  scanStream?.getTracks().forEach((track) => {
-    track.stop();
-  });
+  const video = app.querySelector<HTMLVideoElement>("#scan-video");
+  if (video) {
+    video.pause();
+    video.srcObject = null;
+  }
+  scanStream?.getTracks().forEach((track) => track.stop());
   scanStream = undefined;
   scanDetector = undefined;
+  if (scanCanvas) {
+    scanCanvas.width = 0;
+    scanCanvas.height = 0;
+    scanCanvas = undefined;
+  }
   state.scanActive = false;
-  state.scanSource = undefined;
+}
 
-  if (notice) setNotice(notice);
+function navigate(route: Route, identityId = state.activeIdentityId) {
+  if (state.busy) return;
+  ++sessionEpoch;
+  stopScanCapture();
+  clearSensitiveFields();
+  state.authRequest = undefined;
+  state.feedback = undefined;
+  state.route = route;
+  state.activeIdentityId = identityId;
   render();
 }
 
-function handleRouteChange() {
-  const route = currentRoute();
-  const scanBelongsToRoute =
-    (route === "auth" && state.scanSource === "screen") ||
-    (route === "authorize" && state.scanSource === "camera");
+function clearSession() {
+  ++sessionEpoch;
+  stopScanCapture();
+  clearSensitiveFields();
+  for (const identity of state.identities) disposeIdentity(identity);
+  state.identities = [];
+  state.identityNames = {};
+  state.activeIdentityId = undefined;
+  state.authRequest = undefined;
+  state.feedback = undefined;
+  state.busy = undefined;
+  state.route = "identities";
+}
 
-  if (!scanBelongsToRoute && state.scanActive) {
-    stopScanCapture();
-    return;
-  }
-  render();
+function clearSensitiveFields() {
+  app
+    .querySelectorAll<
+      HTMLInputElement | HTMLTextAreaElement
+    >("#recovery-phrase, #auth-link")
+    .forEach((input) => {
+      input.value = "";
+    });
+}
+
+function deleteActiveIdentity() {
+  const identity = activeIdentity();
+  if (!identity || state.busy) return;
+  disposeIdentity(identity);
+  state.identities = state.identities.filter((item) => item !== identity);
+  delete state.identityNames[identity.id];
+  navigate("identities", state.identities[0]?.id);
 }
 
 function activeIdentity() {
   return state.identities.find(
-    (identity) => identity.id === state.activeIdentityId,
+    (identity) =>
+      identity.id === state.activeIdentityId &&
+      identity.environment === state.environment,
   );
-}
-
-function detailIdentity() {
-  const id = detailIdentityId();
-  return state.identities.find((identity) => identity.id === id);
-}
-
-function authorizeIdentity() {
-  const id = authorizeIdentityId();
-  return state.identities.find((identity) => identity.id === id);
-}
-
-function renameIdentity() {
-  const id = renameIdentityId();
-  return state.identities.find((identity) => identity.id === id);
-}
-
-function deleteIdentity(id: string) {
-  state.identities = state.identities.filter((identity) => identity.id !== id);
-  delete state.identityNames[id];
-  if (state.activeIdentityId === id) {
-    setActiveIdentityId(state.identities[0]?.id);
-  }
-  clearStatus();
-  window.location.hash = "#/identities";
-}
-
-function setActiveIdentity(identity: SignerIdentity) {
-  const index = state.identities.findIndex((item) => item.id === identity.id);
-  if (index === -1) {
-    state.identities = [...state.identities, identity];
-  } else {
-    state.identities[index] = identity;
-  }
-  setActiveIdentityId(identity.id);
-}
-
-function setActiveIdentityId(id: string | undefined) {
-  state.activeIdentityId = id;
-}
-
-async function run(label: string, task: () => Promise<void>) {
-  state.busy = label;
-  clearStatus();
-  render();
-
-  try {
-    await task();
-  } catch (error) {
-    setError(error);
-  } finally {
-    state.busy = undefined;
-    render();
-  }
-}
-
-function updateBusy(label: string) {
-  state.busy = label;
-  render();
 }
 
 function identityName(identity: SignerIdentity) {
-  return identityNameFromPublicKey(identity.publicKey);
-}
-
-function identityNameFromPublicKey(publicKey: string) {
-  const index = state.identities.findIndex(
-    (identity) => identity.publicKey === publicKey,
+  return (
+    state.identityNames[identity.id] ||
+    `Identity ${String(state.identities.indexOf(identity) + 1).padStart(2, "0")}`
   );
-  const identity = state.identities[index];
-  if (identity && state.identityNames[identity.id])
-    return state.identityNames[identity.id];
-  return `Test identity ${index >= 0 ? String(index + 1).padStart(2, "0") : ""}`.trim();
 }
 
 function identityAvatar(identity: SignerIdentity) {
-  const seed = identity.publicKey.startsWith("pk:")
-    ? identity.publicKey.slice(3).trim()
-    : identity.publicKey.trim();
-
-  return `
-    <span class="identity-avatar" aria-hidden="true">${toSvg(seed, 48)}</span>
-  `;
-}
-
-function setNotice(notice: string) {
-  state.notice = notice;
-  state.error = undefined;
-}
-
-function setError(error: unknown) {
-  state.error = formatError(error);
-  state.notice = undefined;
-}
-
-function clearStatus() {
-  state.error = undefined;
-  state.notice = undefined;
-}
-
-function authRequestSummary(request: AuthRequestPreview) {
-  const source = request.xCallback?.xSource;
-  const mode =
-    request.authMode === "grant"
-      ? "Grant-based auth"
-      : "Cookie-based auth";
-  const permissions = `${request.capabilities.length} permission${
-    request.capabilities.length === 1 ? "" : "s"
-  }`;
-
-  return [
-    mode,
-    source ? `from ${source}` : undefined,
-    request.clientId ? `client ${request.clientId}` : undefined,
-    permissions,
-  ]
-    .filter(Boolean)
-    .join(" · ");
+  return `<span class="identity-avatar" aria-hidden="true">${toSvg(identity.publicKey, 48)}</span>`;
 }
 
 function feedbackAction(
-  request: AuthRequestPreview | undefined,
+  request: AuthRequestPreview,
   outcome: "success" | "error" | "cancel",
 ) {
-  if (!request) return undefined;
   const url = callbackUrlFor(request, outcome);
   if (!url) return undefined;
+  return { label: `Return to ${new URL(url).hostname}`, url };
+}
 
-  return {
-    label: request.xCallback?.xSource
-      ? `Return to ${request.xCallback.xSource}`
-      : "Return to app",
-    url,
+function setCoreError(error: unknown, fallback: string) {
+  state.feedback = {
+    kind: "error",
+    message: error instanceof Error ? error.message : fallback,
   };
 }
 
-function beginLoginFeedback(title: string, detail?: string) {
-  window.clearTimeout(loginFeedbackTimer);
-  loginFeedbackTimer = undefined;
-  state.loginFeedback = { detail, kind: "progress", title };
-}
-
-function showLoginFeedback(
-  title: string,
-  kind: "success" | "error" | "cancel",
-  detail?: string,
-  action?: LoginFeedbackAction,
-) {
-  window.clearTimeout(loginFeedbackTimer);
-  const feedback: LoginFeedback = { action, detail, kind, title };
-  state.loginFeedback = feedback;
-  render();
-
-  loginFeedbackTimer = window.setTimeout(
-    () => {
-      if (state.loginFeedback !== feedback) return;
-      state.loginFeedback = undefined;
-      loginFeedbackTimer = undefined;
-      render();
-    },
-    action ? 15_000 : kind === "success" ? 4_500 : 7_000,
-  );
-}
-
-function currentRoute(): Route {
-  if (window.location.hash === "#/auth") return "auth";
-  if (authorizeIdentity()) return "authorize";
-  if (renameIdentity()) return "rename";
-  if (detailIdentity()) return "identity";
-  return "identities";
-}
-
-function detailIdentityId() {
-  const prefix = "#/identities/";
-  if (!window.location.hash.startsWith(prefix)) return undefined;
-
-  try {
-    return decodeURIComponent(window.location.hash.slice(prefix.length));
-  } catch {
-    return undefined;
-  }
-}
-
-function identityDetailHref(id: string) {
-  return `#/identities/${encodeURIComponent(id)}`;
-}
-
-function authorizeIdentityId() {
-  const prefix = "#/authorize/";
-  if (!window.location.hash.startsWith(prefix)) return undefined;
-
-  try {
-    return decodeURIComponent(window.location.hash.slice(prefix.length));
-  } catch {
-    return undefined;
-  }
-}
-
-function authorizeHref(id: string) {
-  return `#/authorize/${encodeURIComponent(id)}`;
-}
-
-function renameIdentityId() {
-  const prefix = "#/rename/";
-  if (!window.location.hash.startsWith(prefix)) return undefined;
-
-  try {
-    return decodeURIComponent(window.location.hash.slice(prefix.length));
-  } catch {
-    return undefined;
-  }
-}
-
-function renameHref(id: string) {
-  return `#/rename/${encodeURIComponent(id)}`;
-}
-
-function appBackHref(route: Route) {
-  if (route === "identity") return "#/identities";
-  if (route === "rename") {
-    const identity = renameIdentity();
-    return identity ? identityDetailHref(identity.id) : "#/identities";
-  }
-  if (route === "authorize") {
-    const identity = authorizeIdentity();
-    return identity ? identityDetailHref(identity.id) : "#/identities";
-  }
-  return undefined;
-}
-
-function formValue(formData: FormData, name: string) {
-  return String(formData.get(name) || "");
-}
-
 function shortPubky(value: string) {
-  if (value.length <= 22) return value;
-  return `${value.slice(0, 10)}…${value.slice(-8)}`;
-}
-
-function overviewPubky(value: string) {
-  const pubky = value.replace(/^pubky/i, "");
-  if (pubky.length <= 10) return pubky;
-  return `${pubky.slice(0, 5)}...${pubky.slice(-5)}`;
+  return value.length > 22 ? `${value.slice(0, 10)}…${value.slice(-8)}` : value;
 }
 
 function disabledAttr(disabled = false) {
@@ -1524,11 +830,6 @@ function getAppElement() {
   return element;
 }
 
-function formatError(error: unknown) {
-  if (error instanceof Error) return error.message;
-  return String(error);
-}
-
 function escapeHtml(value: unknown) {
   return String(value).replace(
     /[&<>"']/g,
@@ -1536,76 +837,59 @@ function escapeHtml(value: unknown) {
   );
 }
 
-function svgIcon(path: string, viewBox = "0 0 24 24") {
-  return `<svg viewBox="${viewBox}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${path}</svg>`;
+function svgIcon(path: string) {
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${path}</svg>`;
 }
-
 function checkIcon() {
   return svgIcon('<path d="m5 12 4 4L19 6"/>');
 }
-
 function closeIcon() {
   return svgIcon('<path d="m6 6 12 12M18 6 6 18"/>');
 }
-
 function clipboardIcon() {
   return svgIcon(
     '<path d="M9 5H7a2 2 0 0 0-2 2v12h14V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/>',
   );
 }
-
 function folderIcon() {
   return svgIcon(
     '<path d="M3 6h6l2 2h10v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6Z"/>',
   );
 }
-
 function pencilIcon() {
   return svgIcon(
     '<path d="m4 20 4.2-1 10.4-10.4a2 2 0 0 0-2.8-2.8L5.4 16.2 4 20Z"/><path d="m14.5 7.1 2.8 2.8"/>',
   );
 }
-
 function arrowLeftIcon() {
   return svgIcon('<path d="m15 18-6-6 6-6"/>');
 }
-
 function plusIcon() {
   return svgIcon('<path d="M12 5v14M5 12h14"/>');
 }
-
 function keyringIcon() {
   return svgIcon(
     '<circle cx="9" cy="14" r="4"/><path d="m12 11 7-7m-3 3 2 2M5 5l2 2"/>',
   );
 }
-
-function boltIcon() {
-  return svgIcon('<path d="m13 2-9 12h7l-1 8 9-12h-7l1-8Z"/>');
-}
-
 function codeIcon() {
   return svgIcon('<path d="m8 9-3 3 3 3m8-6 3 3-3 3m-2-9-4 12"/>');
 }
-
 function trashIcon() {
   return svgIcon(
     '<path d="M4 7h16m-10 4v5m4-5v5M9 7l1-3h4l1 3m3 0-1 13H7L6 7"/>',
   );
 }
-
 function scanIcon() {
   return svgIcon(
     '<path d="M4 8V5a1 1 0 0 1 1-1h3m8 0h3a1 1 0 0 1 1 1v3m0 8v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/>',
   );
 }
-
 function externalIcon() {
   return svgIcon(
     '<path d="M14 5h5v5m0-5-8 8"/><path d="M18 13v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
   );
 }
-
 function githubIcon() {
   return svgIcon(
     '<path d="M15 22v-3.9c0-1 .1-1.5-.5-2.1 2.8-.3 5.7-1.4 5.7-6.2 0-1.3-.5-2.4-1.3-3.3.1-.3.6-1.6-.1-3.3 0 0-1.1-.3-3.5 1.3a12 12 0 0 0-6.3 0C6.6 2.9 5.5 3.2 5.5 3.2c-.7 1.7-.2 3-.1 3.3-.8.9-1.3 2-1.3 3.3 0 4.8 2.9 5.9 5.7 6.2-.5.5-.6 1.1-.6 2.1V22"/><path d="M9.2 19c-2.8.9-2.8-1.5-4-2"/>',

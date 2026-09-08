@@ -1,80 +1,95 @@
 # Pubky Ring Simulator
 
-> [!WARNING]
-> This is experimental developer tooling, built quickly for local testing rather than engineered to
-> production standards. It is not Pubky Ring and should not be relied on for real identities or any
-> use beyond development and testing.
+**How this fork differs from upstream:** This version works with the public **staging and
+production** environments, selected in the interface. It imports an existing identity from its
+recovery phrase and verifies that the identity is registered with the selected homeserver.
+**Account creation, generated identities, local testnet setup, and Quick Mode are removed.**
 
-**Live simulator:** [simulator.pubkyring.app](https://simulator.pubkyring.app/)
+**Live simulator:** [pubky-ring-simulator-its-gaib.vercel.app](https://pubky-ring-simulator-its-gaib.vercel.app/)
 
-Pubky Ring Simulator is an opinionated browser tool for testing Pubky authentication with multiple
-disposable identities. Its interface is inspired by
-[Pubky Ring](https://github.com/pubky/pubky-ring), while its workflows are optimized for local app
-development.
+Fork of [pubky/pubky-ring-simulator](https://github.com/pubky/pubky-ring-simulator).
+The original simulator is designed to create disposable identities on a local testnet.
 
-## Ephemeral by design
+## Use the simulator
 
-Identities exist in memory only. The simulator does not provide recovery phrases, import, export,
-backup, or persistent browser storage. Reloading or closing the page permanently discards every
-generated key.
+1. Select **Staging** or **Production**. Staging is selected initially.
+2. Enter the existing identity's English BIP39 recovery phrase. Invalid phrases, identities
+   without a published homeserver, and identities registered in the other environment are
+   rejected. A network or server failure is reported as an inability to verify the identity.
+3. Paste a `pubkyauth://` sign-in request into the approval form and preview it. Camera scanning
+   is also available when the browser supports QR detection; pasting works in Firefox.
+4. Review the selected identity, environment, requesting application, relay, and permissions,
+   then explicitly approve or decline. Pasting or scanning never approves automatically.
 
-Creating an identity still registers its public key with the local testnet Homeserver. The private
-key never leaves the current page and cannot be recovered after it disappears.
+Both grant-based and legacy cookie sign-in requests are supported. Signup and direct-signup
+requests are rejected in the signing code. Approval links must use the selected environment's
+official HTTPS relay. HTTPS callback links, when provided, are opened only by an explicit click.
 
-## Local testnet only
+## Environments
 
-There is no mainnet mode and there are no network, Homeserver, admin-password, or registration-code
-controls in the UI.
+| Environment | Homeserver | Approval relay |
+|---|---|---|
+| Staging | `https://homeserver.staging.pubky.app` | `https://httprelay.staging.pubky.app/inbox` |
+| Production | `https://homeserver.pubky.app` | `https://httprelay.pubky.app/inbox` |
 
-The app only works when the default testnet environment is running on the same machine. Start
-[pubky/pubky-docker](https://github.com/pubky/pubky-docker) before opening the simulator:
+Both environments use the public PKARR network. The selector checks that the imported Pubky
+identity resolves to the official homeserver for that environment; it does not migrate accounts.
+Custom homeservers, custom relays, and local testnets are outside this fork's supported profiles.
 
-```bash
-git clone https://github.com/pubky/pubky-docker.git
-cd pubky-docker
-cp .env-sample .env
-docker compose --profile backend up -d
-```
+Registration is verified by resolving the identity's signed homeserver record and authenticating
+an existing account with a temporary SDK session. The session's identity and homeserver must
+match, and its validation grant is revoked immediately. If verification or revocation fails,
+the import is rejected. This check runs again before approving an application request.
+SDK sign-in can refresh an existing PKARR record; it does not create an account.
 
-The simulator assumes Pubky Docker's default Homeserver identity, local ports, admin endpoint, and
-admin password. Grant requests require a Homeserver build with grant authentication support, so use
-an up-to-date Pubky Docker environment.
+## Keys stay in the current tab
 
-## Quick auth
+The phrase is used locally to derive the same key as Pubky Ring: English BIP39 with an empty
+passphrase, using the first 32 bytes of the derived seed. The input is cleared after each attempt.
+Loaded keys and names are held in memory. They are not saved to localStorage,
+IndexedDB, or a backend. Reloading, closing the page, or switching environments forgets them.
+Removing an identity from this tab leaves its homeserver account intact.
 
-Paste or screen-scan a `pubkyauth://` cookie or grant sign-in request and use the primary action:
-
-- If the active identity is already registered, it is used immediately.
-- If another registered identity exists, it becomes active and is used.
-- If no registered identity exists, the simulator creates one, registers it on the default local
-  Homeserver, and approves the sign-in request in one flow.
-
-Registration details remain hidden, including obtaining any server-required registration
-credential from the default local admin endpoint.
-
-Regular mode previews whether a request uses grant or legacy cookie authentication, identifies the
-requesting application when provided, and shows whether each capability targets an exact path or a
-directory. Signup requests must target the default local Homeserver. Direct-signup links are not
-supported because the simulator creates and registers test identities itself.
-
-If a request contains callback destinations, the result notification offers a return-to-app link.
-Callback destinations are untrusted and are only opened after you select that link.
+This is an experimental browser signing tool, not the native Pubky Ring application. Importing a
+phrase gives the code served by this origin access to its signing key. The hosted site and its
+operator must be trusted with that access. Memory cleanup is not a guarantee of forensic erasure.
+There are no analytics, session recordings, or third-party scripts. Authorization secrets and
+recovery phrases are not included in logs or diagnostic messages.
 
 ## Development
 
+Use Node.js 22.12 or newer.
+
 ```bash
-npm install
+npm ci
 npm run dev
 ```
 
-Build the production site with:
-
-```bash
-npm run build
-```
-
-Run the auth-link parser tests with:
+The development server uses the same staging/production profiles. No local Pubky Docker stack
+or homeserver admin credentials are needed.
 
 ```bash
 npm test
+npm run check
+npm run build
+npm run audit
 ```
+
+The automated tests cover the import/registration policy, mnemonic derivation, environment
+isolation, sign-in parsing, signup rejection, and approval consent boundaries. Testing approval
+against a real account requires its owner to import and approve personally.
+
+## Deployment
+
+Deploy the static `dist/` output with the included `vercel.json`. It sets a restrictive Content
+Security Policy, disables framing, suppresses referrers, and limits network connections to the
+official PKARR, homeserver, and approval relay origins. Dependencies and the logo are bundled
+locally. The inherited GitHub Pages deployment workflow is removed because this deployment uses
+Vercel's response headers.
+
+```bash
+vercel --prod
+```
+
+Use equivalent response headers when deploying with another host. Do not add analytics or
+session replay to a page that handles recovery phrases.

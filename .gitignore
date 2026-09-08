@@ -12,6 +12,8 @@ dist
 dist-ssr
 .test-dist
 *.local
+.vercel
+.env*
 
 # Editor directories and files
 .vscode/*
