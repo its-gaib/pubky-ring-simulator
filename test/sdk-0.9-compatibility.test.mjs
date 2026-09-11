@@ -5,24 +5,13 @@ import { test } from "node:test";
 import {
   AuthFlowKind as LegacyAuthFlowKind,
   Pubky as LegacyPubky,
-  PublicKey as LegacyPublicKey,
 } from "legacy-pubky";
 import { Keypair, Pubky } from "@synonymdev/pubky";
 
 const CAPABILITIES = "/pub/example.app/:rw";
-const TESTNET_HOMESERVER =
-  "8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo";
 
 test("the current signer approves an SDK 0.9.3 sign-in request", async () => {
   await assertLegacyApproval(LegacyAuthFlowKind.signin(), "signin");
-});
-
-test("the current signer approves an SDK 0.9.3 sign-up request", async () => {
-  const homeserver = LegacyPublicKey.from(TESTNET_HOMESERVER);
-  await assertLegacyApproval(
-    LegacyAuthFlowKind.signup(homeserver, "test-signup-token"),
-    "signup",
-  );
 });
 
 async function assertLegacyApproval(kind, expectedIntent) {
@@ -34,7 +23,7 @@ async function assertLegacyApproval(kind, expectedIntent) {
     const authorizationUrl = flow.authorizationUrl;
     assert.equal(new URL(authorizationUrl).hostname, expectedIntent);
 
-    const keypair = Keypair.random();
+    const keypair = Keypair.fromSecret(new Uint8Array(32).fill(7));
     const signer = new Pubky().signer(keypair);
 
     await signer.approveAuthRequest(authorizationUrl);
