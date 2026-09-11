@@ -522,6 +522,53 @@ h2 {
   margin: -2px 0 7px;
   text-align: left;
 }
+.recovery-words {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.recovery-words legend {
+  margin-bottom: 12px;
+  font-size: 0.79rem;
+  font-weight: 650;
+}
+.recovery-word-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px 8px;
+}
+.recovery-word-field {
+  position: relative;
+  min-width: 0;
+}
+.recovery-word-field label {
+  position: absolute;
+  top: 50%;
+  left: 10px;
+  z-index: 1;
+  transform: translateY(-50%);
+  color: #979fae;
+  font-size: 0.69rem;
+  font-variant-numeric: tabular-nums;
+}
+.recovery-word-field input {
+  padding: 12px 7px 12px 31px;
+  font-size: 0.79rem;
+}
+.recovery-word-field input[aria-invalid="true"] {
+  border-color: #f2a09b;
+}
+.recovery-word-status {
+  min-height: 1.4em;
+  margin: -3px 0 0;
+  color: #979fae;
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
+.recovery-word-status.error {
+  color: #f2a09b;
+}
 .identity-list {
   display: grid;
   gap: 14px;
@@ -913,6 +960,12 @@ h2 {
   }
 }
 @media (max-width: 420px) {
+  .recovery-word-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .recovery-word-field input {
+    font-size: 1rem;
+  }
   .site-shell {
     width: 100%;
     padding-top: 0.75rem;

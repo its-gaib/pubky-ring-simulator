@@ -2,6 +2,13 @@ import pubkyPackage from "@synonymdev/pubky/package.json";
 import { toSvg } from "jdenticon/browser";
 import "./style.css";
 import {
+  RECOVERY_WORD_COUNT,
+  RECOVERY_WORDS,
+  isRecoveryWord,
+  normalizeRecoveryWord,
+  recoveryWordPaste,
+} from "./recovery-input";
+import {
   ENVIRONMENTS,
   approveAuthRequest,
   callbackUrlFor,
@@ -77,6 +84,10 @@ let scanCanvas: HTMLCanvasElement | undefined;
 
 app.addEventListener("click", handleClick);
 app.addEventListener("submit", handleSubmit);
+app.addEventListener("paste", handleRecoveryPaste);
+app.addEventListener("input", handleRecoveryInput);
+app.addEventListener("focusout", handleRecoveryBlur);
+app.addEventListener("keydown", handleRecoveryKeydown);
 window.addEventListener("pagehide", () => clearSession());
 window.addEventListener("pageshow", () => render());
 document.addEventListener("visibilitychange", () => {
@@ -219,11 +230,26 @@ function importPage() {
   return `
     <section class="screen-section import-screen">
       <div class="section-heading"><p class="eyebrow">${escapeHtml(ENVIRONMENTS[state.environment].label)}</p><h1>Import an identity</h1></div>
-      <p class="intro">Enter the full recovery phrase for an existing identity. We briefly sign in to ${escapeHtml(new URL(ENVIRONMENTS[state.environment].homeserverUrl).hostname)} to confirm the account exists, then sign out.</p>
+      <p class="intro">Enter the 12 recovery words for an existing identity, in order. We briefly sign in to ${escapeHtml(new URL(ENVIRONMENTS[state.environment].homeserverUrl).hostname)} to confirm the account exists, then sign out.</p>
       <form id="import-identity-form" class="stacked-form" autocomplete="off">
-        <label for="recovery-phrase">Recovery phrase</label>
-        <input id="recovery-phrase" name="recovery-phrase" type="password" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" maxlength="512" placeholder="Enter all recovery words, separated by spaces" required ${disabledAttr()}>
-        <p class="helper field-helper">The phrase is cleared from this field as soon as you submit it.</p>
+        <fieldset class="recovery-words" aria-describedby="recovery-word-help recovery-word-status" ${disabledAttr()}>
+          <legend>Recovery phrase · 12 words</legend>
+          <div class="recovery-word-grid">
+            ${Array.from(
+              { length: RECOVERY_WORD_COUNT },
+              (_, index) => `
+              <div class="recovery-word-field">
+                <label for="recovery-word-${index + 1}" aria-hidden="true">${index + 1}.</label>
+                <input id="recovery-word-${index + 1}" data-recovery-word="${index}" name="recovery-word-${index + 1}" aria-label="Word ${index + 1}" aria-describedby="recovery-word-status" type="text" list="bip39-words" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" maxlength="512" placeholder="word" required ${disabledAttr()}>
+              </div>
+            `,
+            ).join("")}
+          </div>
+        </fieldset>
+        <datalist id="bip39-words">${RECOVERY_WORDS.map((word) => `<option value="${word}"></option>`).join("")}</datalist>
+        <p id="recovery-word-help" class="helper field-helper">Paste all 12 words into any field, or type one word at a time. Press Space or Tab to move forward.</p>
+        <p id="recovery-word-status" class="recovery-word-status" role="status" aria-live="polite">0 of 12 words entered.</p>
+        <p class="helper field-helper">All word fields are cleared as soon as you submit the phrase.</p>
         <button class="button accent wide" type="submit" ${disabledAttr()}>${checkIcon()} Verify and import</button>
       </form>
     </section>
@@ -439,10 +465,22 @@ function handleSubmit(event: SubmitEvent) {
 }
 
 async function handleImportIdentity(form: HTMLFormElement) {
-  const input = form.querySelector<HTMLInputElement>("#recovery-phrase");
-  if (!input) return;
-  let phrase = input.value;
-  input.value = "";
+  const inputs = recoveryWordInputs(form);
+  if (inputs.length !== RECOVERY_WORD_COUNT) return;
+  inputs.forEach(validateRecoveryWord);
+  const invalid = inputs.find(
+    (input) => !input.value || !isRecoveryWord(input.value),
+  );
+  if (invalid) {
+    updateRecoveryWordStatus();
+    invalid.reportValidity();
+    invalid.focus();
+    return;
+  }
+  let phrase = inputs
+    .map((input) => normalizeRecoveryWord(input.value))
+    .join(" ");
+  clearSensitiveFields();
   const epoch = sessionEpoch;
   const environment = state.environment;
   state.feedback = undefined;
@@ -766,10 +804,135 @@ function clearSensitiveFields() {
   app
     .querySelectorAll<
       HTMLInputElement | HTMLTextAreaElement
-    >("#recovery-phrase, #auth-link")
+    >("[data-recovery-word], #auth-link")
     .forEach((input) => {
       input.value = "";
     });
+}
+
+function recoveryWordInputs(root: ParentNode = app): HTMLInputElement[] {
+  return Array.from(
+    root.querySelectorAll<HTMLInputElement>("[data-recovery-word]"),
+  );
+}
+
+function recoveryWordTarget(event: Event): HTMLInputElement | undefined {
+  const input = event.target;
+  return input instanceof HTMLInputElement &&
+    input.matches("[data-recovery-word]")
+    ? input
+    : undefined;
+}
+
+function validateRecoveryWord(input: HTMLInputElement) {
+  input.value = normalizeRecoveryWord(input.value);
+  const invalid = Boolean(input.value) && !isRecoveryWord(input.value);
+  input.setCustomValidity(
+    invalid ? "Enter one English BIP39 recovery word." : "",
+  );
+  if (invalid) input.setAttribute("aria-invalid", "true");
+  else input.removeAttribute("aria-invalid");
+}
+
+function updateRecoveryWordStatus(message?: string) {
+  const status = app.querySelector<HTMLElement>("#recovery-word-status");
+  if (!status) return;
+  const inputs = recoveryWordInputs();
+  const invalid = inputs.filter(
+    (input) => input.getAttribute("aria-invalid") === "true",
+  );
+  status.textContent =
+    message ||
+    (invalid.length
+      ? `Check word ${invalid.map((input) => Number(input.dataset.recoveryWord) + 1).join(", ")}. Use English BIP39 words.`
+      : `${inputs.filter((input) => input.value.trim()).length} of 12 words entered.`);
+  status.classList.toggle("error", Boolean(message) || invalid.length > 0);
+}
+
+function handleRecoveryInput(event: Event) {
+  const input = recoveryWordTarget(event);
+  if (!input || state.busy) return;
+  // Clear stale validation while the word is being corrected. Validate on blur.
+  input.setCustomValidity("");
+  input.removeAttribute("aria-invalid");
+  updateRecoveryWordStatus();
+}
+
+function handleRecoveryBlur(event: FocusEvent) {
+  const input = recoveryWordTarget(event);
+  if (!input || state.busy) return;
+  validateRecoveryWord(input);
+  updateRecoveryWordStatus();
+}
+
+function handleRecoveryPaste(event: ClipboardEvent) {
+  const input = recoveryWordTarget(event);
+  if (!input || state.busy || !event.clipboardData) return;
+  event.preventDefault();
+  let pasted = event.clipboardData.getData("text/plain");
+  let words: string[] = [];
+  try {
+    const plan = recoveryWordPaste(pasted, Number(input.dataset.recoveryWord));
+    words = plan.words;
+    if (!words.length) return;
+    const inputs = recoveryWordInputs();
+    if (words.length === 1) {
+      input.setRangeText(
+        words[0],
+        input.selectionStart ?? 0,
+        input.selectionEnd ?? input.value.length,
+        "end",
+      );
+      validateRecoveryWord(input);
+    } else {
+      words.forEach((word, offset) => {
+        const field = inputs[plan.startIndex + offset];
+        field.value = word;
+        validateRecoveryWord(field);
+      });
+      const next =
+        inputs[
+          Math.min(plan.startIndex + words.length, RECOVERY_WORD_COUNT - 1)
+        ];
+      next.focus();
+      next.select();
+    }
+    updateRecoveryWordStatus();
+  } catch {
+    updateRecoveryWordStatus(
+      "That paste does not fit. Use a 12-word phrase or fewer words in the remaining fields.",
+    );
+  } finally {
+    pasted = "";
+    words.fill("");
+  }
+}
+
+function handleRecoveryKeydown(event: KeyboardEvent) {
+  const input = recoveryWordTarget(event);
+  if (
+    !input ||
+    state.busy ||
+    event.isComposing ||
+    event.ctrlKey ||
+    event.altKey ||
+    event.metaKey
+  )
+    return;
+  const inputs = recoveryWordInputs();
+  const index = Number(input.dataset.recoveryWord);
+  if (event.key === " " && input.value.trim()) {
+    event.preventDefault();
+    validateRecoveryWord(input);
+    updateRecoveryWordStatus();
+    if (isRecoveryWord(input.value) && index < RECOVERY_WORD_COUNT - 1) {
+      inputs[index + 1].focus();
+      inputs[index + 1].select();
+    }
+  } else if (event.key === "Backspace" && !input.value && index > 0) {
+    event.preventDefault();
+    inputs[index - 1].focus();
+  }
 }
 
 function deleteActiveIdentity() {

@@ -13,7 +13,9 @@ The original simulator is designed to create disposable identities on a local te
 ## Use the simulator
 
 1. Select **Staging** or **Production**. Staging is selected initially.
-2. Enter the existing identity's English BIP39 recovery phrase. Invalid phrases, identities
+2. Enter the existing identity's 12-word English BIP39 recovery phrase in the numbered, visible
+   fields, or paste the complete phrase into any field. Local word suggestions help with spelling;
+   Space and Tab move between fields. Invalid phrases, identities
    without a published homeserver, and identities registered in the other environment are
    rejected. A network or server failure is reported as an inability to verify the identity.
 3. Paste a `pubkyauth://` sign-in request into the approval form and preview it. Camera scanning
@@ -45,7 +47,7 @@ SDK sign-in can refresh an existing PKARR record; it does not create an account.
 ## Keys stay in the current tab
 
 The phrase is used locally to derive the same key as Pubky Ring: English BIP39 with an empty
-passphrase, using the first 32 bytes of the derived seed. The input is cleared after each attempt.
+passphrase, using the first 32 bytes of the derived seed. All word fields are cleared on submission.
 Loaded keys and names are held in memory. They are not saved to localStorage,
 IndexedDB, or a backend. Reloading, closing the page, or switching environments forgets them.
 Removing an identity from this tab leaves its homeserver account intact.
