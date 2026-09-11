@@ -9,12 +9,13 @@
     "check": "tsc",
     "dev": "vite",
     "preview": "vite preview",
-    "test": "tsc -p tsconfig.test.json && node --test .test-dist/test/pubky.test.js .test-dist/test/recovery-input.test.js test/sdk-0.9-compatibility.test.mjs"
+    "test": "tsc -p tsconfig.test.json && node --test .test-dist/test/pubky.test.js .test-dist/test/recovery-input.test.js .test-dist/test/profile.test.js test/sdk-0.9-compatibility.test.mjs"
   },
   "dependencies": {
     "@scure/bip39": "2.4.0",
     "@synonymdev/pubky": "^0.11.0",
-    "jdenticon": "^3.3.0"
+    "jdenticon": "^3.3.0",
+    "pubky-app-specs": "0.7.0"
   },
   "devDependencies": {
     "legacy-pubky": "npm:@synonymdev/pubky@0.9.3",

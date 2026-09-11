@@ -7,6 +7,8 @@ recovery phrase and verifies that the identity is registered with the selected h
 
 **Live simulator:** [pubky-ring-simulator.vercel.app](https://pubky-ring-simulator.vercel.app/)
 
+**Dev tooling — NOT SAFE. Only use with throwaway identities!**
+
 Fork of [pubky/pubky-ring-simulator](https://github.com/pubky/pubky-ring-simulator).
 The original simulator is designed to create disposable identities on a local testnet.
 
@@ -18,6 +20,9 @@ The original simulator is designed to create disposable identities on a local te
    Space and Tab move between fields. Invalid phrases, identities
    without a published homeserver, and identities registered in the other environment are
    rejected. A network or server failure is reported as an inability to verify the identity.
+   After verification, the simulator reads the public profile using `pubky-app-specs` and
+   displays its name and photo. Missing or unavailable names fall back to `Identity 01`,
+   `Identity 02`, and so on; unavailable photos fall back to the generated avatar.
 3. Paste a `pubkyauth://` sign-in request into the approval form and preview it. Camera scanning
    is also available when the browser supports QR detection; pasting works in Firefox.
 4. Review the selected identity, environment, requesting application, relay, and permissions,
@@ -48,9 +53,15 @@ SDK sign-in can refresh an existing PKARR record; it does not create an account.
 
 The phrase is used locally to derive the same key as Pubky Ring: English BIP39 with an empty
 passphrase, using the first 32 bytes of the derived seed. All word fields are cleared on submission.
-Loaded keys and names are held in memory. They are not saved to localStorage,
+Loaded keys, names, and profile pictures are held in memory. They are not saved to localStorage,
 IndexedDB, or a backend. Reloading, closing the page, or switching environments forgets them.
 Removing an identity from this tab leaves its homeserver account intact.
+
+Profile data is read without credentials from the selected homeserver. Supported photos use
+the identity's Pubky file and blob records; invalid or unavailable image data keeps the generated
+avatar. PNG, JPEG, WebP, and GIF images are limited to 5 MiB, 8192 pixels per side, and 16 million
+pixels. Profile loading times out after eight seconds. Renaming an identity overrides its profile
+name in this tab. The verified public key stays visible when reviewing approvals.
 
 This is an experimental browser signing tool, not the native Pubky Ring application. Importing a
 phrase gives the code served by this origin access to its signing key. The hosted site and its

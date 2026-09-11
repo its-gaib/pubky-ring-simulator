@@ -1,6 +1,7 @@
 import pubkyPackage from "@synonymdev/pubky/package.json";
 import { toSvg } from "jdenticon/browser";
 import "./style.css";
+import { loadIdentityProfile } from "./profile";
 import {
   RECOVERY_WORD_COUNT,
   RECOVERY_WORDS,
@@ -50,6 +51,7 @@ interface State {
   feedback?: Feedback;
   identities: SignerIdentity[];
   identityNames: Record<string, string>;
+  identityProfiles: Record<string, { name?: string; avatarUrl?: string }>;
   route: Route;
   scanActive: boolean;
 }
@@ -69,6 +71,7 @@ const state: State = {
   environment: "staging",
   identities: [],
   identityNames: {},
+  identityProfiles: {},
   route: "identities",
   scanActive: false,
 };
@@ -81,6 +84,7 @@ let scanStream: MediaStream | undefined;
 let scanDetector: BarcodeDetectorLike | undefined;
 let scanTimer: number | undefined;
 let scanCanvas: HTMLCanvasElement | undefined;
+let profileController: AbortController | undefined;
 
 app.addEventListener("click", handleClick);
 app.addEventListener("submit", handleSubmit);
@@ -88,6 +92,7 @@ app.addEventListener("paste", handleRecoveryPaste);
 app.addEventListener("input", handleRecoveryInput);
 app.addEventListener("focusout", handleRecoveryBlur);
 app.addEventListener("keydown", handleRecoveryKeydown);
+app.addEventListener("error", handleProfileImageError, true);
 window.addEventListener("pagehide", () => clearSession());
 window.addEventListener("pageshow", () => render());
 document.addEventListener("visibilitychange", () => {
@@ -105,7 +110,7 @@ function render() {
       <aside class="developer-banner">
         <span class="banner-icon" aria-hidden="true">${codeIcon()}</span>
         <div>
-          <strong>Ring simulator · hosted edition</strong>
+          <strong>Ring Simulator · Dev tooling · NOT SAFE — only use with throwaway identities!</strong>
           <p>Approve requests with an existing identity on staging or production. Your recovery phrase gives this page control of that identity.</p>
         </div>
       </aside>
@@ -296,7 +301,7 @@ function renamePage(identity: SignerIdentity) {
       ${identityAvatar(identity)}
       <form id="rename-form" class="stacked-form">
         <label for="identity-name">Identity name</label>
-        <input id="identity-name" name="name" type="text" value="${escapeHtml(identityName(identity))}" maxlength="40" autocomplete="off" required ${disabledAttr()}>
+        <input id="identity-name" name="name" type="text" value="${escapeHtml(identityName(identity))}" maxlength="50" autocomplete="off" required ${disabledAttr()}>
         <button class="button accent wide" type="submit" ${disabledAttr()}>Save</button>
       </form>
     </section>
@@ -510,6 +515,8 @@ async function handleImportIdentity(form: HTMLFormElement) {
         message: `Identity verified on ${ENVIRONMENTS[environment].label}.`,
       };
     }
+    await loadImportedProfile(existing ?? identity, epoch);
+    if (sessionEpoch !== epoch || state.environment !== environment) return;
     state.route = "identity";
   } catch (error) {
     if (sessionEpoch === epoch)
@@ -523,10 +530,41 @@ async function handleImportIdentity(form: HTMLFormElement) {
   }
 }
 
+async function loadImportedProfile(identity: SignerIdentity, epoch: number) {
+  const controller = new AbortController();
+  profileController?.abort();
+  profileController = controller;
+  state.busy = "Loading public profile…";
+  render();
+  try {
+    const profile = await loadIdentityProfile(
+      identity.publicKey,
+      identity.environment,
+      controller.signal,
+    );
+    if (
+      controller.signal.aborted ||
+      sessionEpoch !== epoch ||
+      state.environment !== identity.environment ||
+      !state.identities.includes(identity)
+    )
+      return;
+    const avatarUrl = profile.avatar
+      ? URL.createObjectURL(profile.avatar)
+      : undefined;
+    clearIdentityProfile(identity.id);
+    state.identityProfiles[identity.id] = { name: profile.name, avatarUrl };
+  } catch {
+    // Public display data is optional; it must never reject a verified identity.
+  } finally {
+    if (profileController === controller) profileController = undefined;
+  }
+}
+
 function handleRename(form: HTMLFormElement) {
   const identity = activeIdentity();
   const input = form.querySelector<HTMLInputElement>("#identity-name");
-  const name = input?.value.trim().slice(0, 40);
+  const name = input?.value.trim().slice(0, 50);
   if (!identity || !name) return;
   state.identityNames[identity.id] = name;
   navigate("identity");
@@ -788,9 +826,13 @@ function navigate(route: Route, identityId = state.activeIdentityId) {
 
 function clearSession() {
   ++sessionEpoch;
+  profileController?.abort();
+  profileController = undefined;
   stopScanCapture();
   clearSensitiveFields();
   for (const identity of state.identities) disposeIdentity(identity);
+  for (const id of Object.keys(state.identityProfiles))
+    clearIdentityProfile(id);
   state.identities = [];
   state.identityNames = {};
   state.activeIdentityId = undefined;
@@ -941,6 +983,7 @@ function deleteActiveIdentity() {
   disposeIdentity(identity);
   state.identities = state.identities.filter((item) => item !== identity);
   delete state.identityNames[identity.id];
+  clearIdentityProfile(identity.id);
   navigate("identities", state.identities[0]?.id);
 }
 
@@ -955,12 +998,45 @@ function activeIdentity() {
 function identityName(identity: SignerIdentity) {
   return (
     state.identityNames[identity.id] ||
+    state.identityProfiles[identity.id]?.name ||
     `Identity ${String(state.identities.indexOf(identity) + 1).padStart(2, "0")}`
   );
 }
 
 function identityAvatar(identity: SignerIdentity) {
-  return `<span class="identity-avatar" aria-hidden="true">${toSvg(identity.publicKey, 48)}</span>`;
+  const avatarUrl = state.identityProfiles[identity.id]?.avatarUrl;
+  return `<span class="identity-avatar ${avatarUrl ? "has-profile-image" : ""}" aria-hidden="true">${toSvg(identity.publicKey, 48)}${avatarUrl ? `<img src="${escapeHtml(avatarUrl)}" data-profile-identity="${escapeHtml(identity.id)}" alt="" decoding="async">` : ""}</span>`;
+}
+
+function clearIdentityProfile(id: string) {
+  const avatarUrl = state.identityProfiles[id]?.avatarUrl;
+  if (avatarUrl) URL.revokeObjectURL(avatarUrl);
+  delete state.identityProfiles[id];
+}
+
+function handleProfileImageError(event: Event) {
+  const image = event.target;
+  if (!(image instanceof HTMLImageElement)) return;
+  const id = image.dataset.profileIdentity;
+  if (!id) return;
+  const profile = state.identityProfiles[id];
+  if (!profile?.avatarUrl || image.getAttribute("src") !== profile.avatarUrl)
+    return;
+  const avatarUrl = profile.avatarUrl;
+  delete profile.avatarUrl;
+  URL.revokeObjectURL(avatarUrl);
+  // Update only avatar elements so an image error cannot clear words being entered.
+  app
+    .querySelectorAll<HTMLImageElement>("img[data-profile-identity]")
+    .forEach((item) => {
+      if (
+        item.dataset.profileIdentity !== id ||
+        item.getAttribute("src") !== avatarUrl
+      )
+        return;
+      item.parentElement?.classList.remove("has-profile-image");
+      item.remove();
+    });
 }
 
 function feedbackAction(
