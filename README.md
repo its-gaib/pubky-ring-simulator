@@ -99,15 +99,15 @@ against a real account requires its owner to import and approve personally.
 
 ## Deployment
 
-Deploy the static `dist/` output with the included `vercel.json`. It sets a restrictive Content
+Production deploys automatically from `main` through the connected Vercel Git integration.
+The included `vercel.json` enables Git deployments only for `main`; other branches run CI
+without creating Vercel deployments. Merged pull request branches are deleted automatically.
+
+Vercel builds and serves the static `dist/` output. The configuration sets a restrictive Content
 Security Policy, disables framing, suppresses referrers, and limits network connections to the
 official PKARR, homeserver, and approval relay origins. Dependencies and the logo are bundled
 locally. The inherited GitHub Pages deployment workflow is removed because this deployment uses
 Vercel's response headers.
-
-```bash
-vercel --prod
-```
 
 Use equivalent response headers when deploying with another host. Do not add analytics or
 session replay to a page that handles recovery phrases.
