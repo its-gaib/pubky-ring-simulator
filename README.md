@@ -88,6 +88,11 @@ npm run build
 npm run audit
 ```
 
+CI runs these checks on Node.js 22, 24, and 26. SDK interoperability tests use a local
+relay with current and legacy sign-in clients. The `legacy-pubky` development dependency
+stays pinned to 0.9.3 to retain coverage for older clients, and `@types/node` follows Node 22
+so test code remains compatible with the minimum supported runtime.
+
 The automated tests cover the import/registration policy, mnemonic derivation, environment
 isolation, sign-in parsing, signup rejection, and approval consent boundaries. Testing approval
 against a real account requires its owner to import and approve personally.
