@@ -1,30 +1,40 @@
 import {
-  DirectSignupDeepLink,
   Keypair,
-  PublicKey,
   Pubky,
   SigninDeepLink,
   SigninGrantDeepLink,
-  SignupDeepLink,
-  SignupGrantDeepLink,
+  type Session,
   type XCallbackParams,
 } from "@synonymdev/pubky";
+import { keypairFromRecoveryPhrase } from "./recovery.js";
 
-const TESTNET_HOMESERVER =
-  "8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo";
-const TESTNET_HOMESERVER_PUBLIC_KEY = `pubky${TESTNET_HOMESERVER}`;
-const TESTNET_HOMESERVER_ADMIN_URL = "http://127.0.0.1:6288";
-const TESTNET_HOMESERVER_ADMIN_PASSWORD = "admin";
+export type EnvironmentId = "staging" | "production";
+
+export const ENVIRONMENTS = {
+  staging: {
+    label: "Staging",
+    homeserver: "pubkyufibwbmed6jeq9k4p583go95wofakh9fwpp4k734trq79pd9u1uy",
+    homeserverUrl: "https://homeserver.staging.pubky.app",
+    relayUrl: "https://httprelay.staging.pubky.app/inbox",
+  },
+  production: {
+    label: "Production",
+    homeserver: "pubky8um71us3fyw6h8wbcxb5ar3rwusy1a6u49956ikzojg3gcwd1dty",
+    homeserverUrl: "https://homeserver.pubky.app",
+    relayUrl: "https://httprelay.pubky.app/inbox",
+  },
+} as const;
 
 export interface SignerIdentity {
   createdAt: string;
-  homeserver?: string;
+  environment: EnvironmentId;
+  homeserver: string;
   id: string;
   keypair: Keypair;
   publicKey: string;
 }
 
-export type AuthRequestKind = "signin" | "signup";
+export type AuthRequestKind = "signin";
 export type AuthMode = "cookie" | "grant";
 export type AuthCallbackOutcome = "success" | "error" | "cancel";
 
@@ -39,85 +49,94 @@ export interface AuthRequestPreview {
   authMode: AuthMode;
   capabilities: string[];
   clientId?: string;
-  homeserver?: string;
   kind: AuthRequestKind;
   relay: string;
   url: string;
   xCallback?: AuthCallbacks;
 }
 
-// There is intentionally no mainnet configuration path.
-export const pubky = Pubky.testnet();
+// Both hosted environments use public PKARR; the switch selects a homeserver
+// and relay, not a separate local DHT or testnet client.
+export const pubky = new Pubky();
+const disposedIdentities = new WeakSet<SignerIdentity>();
+const INVALID_REQUEST = "This is not a valid Pubky sign-in request.";
+const SIGNUP_UNSUPPORTED =
+  "Account creation is not supported. Use a sign-in request for an existing identity.";
+const CANCELLED = "Approval was cancelled. Review a fresh request to continue.";
+const UNVERIFIED =
+  "Could not verify an existing account on this homeserver. Check your connection and the selected environment, then try again.";
 
-export function createIdentity(): SignerIdentity {
-  const keypair = Keypair.random();
-  const publicKey = keypair.publicKey.toString();
+export async function importIdentity(
+  phrase: string,
+  environment: EnvironmentId,
+): Promise<SignerIdentity> {
+  const config = environmentConfig(environment);
+  const keypair = await keypairFromRecoveryPhrase(phrase);
+  let accepted = false;
 
-  return {
-    createdAt: new Date().toISOString(),
-    id: publicKey,
-    keypair,
-    publicKey,
-  };
-}
-
-export async function signUpIdentity(identity: SignerIdentity) {
-  if (isIdentityReady(identity)) {
+  try {
+    await assertRegistered(keypair, environment);
+    const publicKeyObject = keypair.publicKey;
+    let publicKey: string;
     try {
-      const resolved = await pubky.getHomeserverOf(identity.keypair.publicKey);
-      if (resolved?.toString() === TESTNET_HOMESERVER_PUBLIC_KEY)
-        return identity;
-    } catch (error) {
-      throw pubkyOperationError(error, "resolve");
+      publicKey = publicKeyObject.toString();
+    } finally {
+      publicKeyObject.free();
     }
+
+    const identity: SignerIdentity = {
+      createdAt: new Date().toISOString(),
+      environment,
+      homeserver: config.homeserver,
+      id: publicKey,
+      keypair,
+      publicKey,
+    };
+    accepted = true;
+    return identity;
+  } finally {
+    if (!accepted) keypair.free();
   }
-
-  await registerIdentity(identity.keypair);
-
-  return {
-    ...identity,
-    homeserver: TESTNET_HOMESERVER_PUBLIC_KEY,
-  };
 }
 
-export function isIdentityReady(identity: SignerIdentity) {
-  return identity.homeserver === TESTNET_HOMESERVER_PUBLIC_KEY;
+export function disposeIdentity(identity: SignerIdentity): void {
+  if (disposedIdentities.has(identity)) return;
+  disposedIdentities.add(identity);
+  identity.keypair.free();
 }
 
 export async function approveAuthRequest(
   identity: SignerIdentity,
   input: string,
-) {
-  const request = assertLocalAuthRequest(parseAuthRequest(input));
-
-  try {
-    await pubky.signer(identity.keypair).approveAuthRequest(request.url);
-  } catch (error) {
-    throw pubkyOperationError(error, "approve");
-  }
-
-  return request;
-}
-
-export function assertSupportedAuthRequest(request: AuthRequestPreview) {
-  if (request.kind !== "signin") {
-    throw new Error(
-      "Use a sign-in request. This tool creates and registers test identities automatically.",
-    );
-  }
-
-  return request;
-}
-
-export function assertLocalAuthRequest(request: AuthRequestPreview) {
+  environment: EnvironmentId,
+  isCurrent: () => boolean = () => true,
+): Promise<AuthRequestPreview> {
+  const config = environmentConfig(environment);
+  const request = parseAuthRequest(input, environment);
   if (
-    request.kind === "signup" &&
-    request.homeserver !== TESTNET_HOMESERVER_PUBLIC_KEY
+    identity.environment !== environment ||
+    identity.homeserver !== config.homeserver
   ) {
     throw new Error(
-      "This signup request targets a different Homeserver. " +
-        "The simulator only supports the default local testnet Homeserver.",
+      "This identity belongs to a different environment. Import it in the matching environment.",
     );
+  }
+  const checkCurrent = () => assertCurrent(identity, isCurrent);
+  checkCurrent();
+  await assertRegistered(identity.keypair, environment, checkCurrent);
+  // Registration checks can finish after a removal or environment change.
+  // Never create a signer for an obsolete approval operation.
+  checkCurrent();
+
+  const signer = pubky.signer(identity.keypair);
+  try {
+    await signer.approveAuthRequest(request.url);
+  } catch {
+    throw new Error(
+      "Could not deliver approval. Check the request is still active and try again.",
+    );
+  } finally {
+    signer.free();
   }
 
   return request;
@@ -126,281 +145,237 @@ export function assertLocalAuthRequest(request: AuthRequestPreview) {
 export function callbackUrlFor(
   request: AuthRequestPreview,
   outcome: AuthCallbackOutcome,
-) {
+): string | undefined {
   const value =
     outcome === "success"
       ? request.xCallback?.xSuccess
       : outcome === "error"
         ? request.xCallback?.xError
         : request.xCallback?.xCancel;
-
   if (!value) return undefined;
 
   try {
-    const protocol = new URL(value).protocol.toLowerCase();
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.username && !url.password
+      ? url.href
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function parseAuthRequest(
+  input: string,
+  environment: EnvironmentId,
+): AuthRequestPreview {
+  const config = environmentConfig(environment);
+  if (typeof input !== "string" || input.length > 16_384) {
+    throw new Error(INVALID_REQUEST);
+  }
+  const link = input.trim();
+  if (!link) throw new Error("Paste or scan a Pubky sign-in link first.");
+  if (/[\u0000-\u0020\u007f]/.test(link)) throw new Error(INVALID_REQUEST);
+
+  let url: URL;
+  try {
+    url = new URL(link);
+  } catch {
+    throw new Error(INVALID_REQUEST);
+  }
+  if (/signup/i.test(url.hostname)) throw new Error(SIGNUP_UNSUPPORTED);
+  if (
+    url.protocol !== "pubkyauth:" ||
+    !["signin", "signin_grant"].includes(url.hostname) ||
+    url.username ||
+    url.password ||
+    url.port ||
+    url.pathname ||
+    url.hash
+  ) {
+    throw new Error(INVALID_REQUEST);
+  }
+
+  const grant = url.hostname === "signin_grant";
+  const allowedParams = new Set([
+    "caps",
+    "relay",
+    "secret",
+    "x-source",
+    "x-success",
+    "x-error",
+    "x-cancel",
+    ...(grant ? ["cid", "cpk"] : []),
+  ]);
+  const seen = new Set<string>();
+  for (const [name, value] of url.searchParams.entries()) {
     if (
-      ["blob:", "data:", "file:", "javascript:", "vbscript:"].includes(
-        protocol,
-      )
-    )
-      return undefined;
-    return value;
-  } catch {
-    return undefined;
-  }
-}
-
-export function parseAuthRequest(input: string): AuthRequestPreview {
-  const link = extractAuthLink(input);
-  const candidates = unique([link, normalizeLooseAuthLink(link)]);
-  const errors: string[] = [];
-
-  for (const candidate of candidates) {
-    const directSignupError = tryParseDirectSignup(candidate);
-    if (directSignupError) throw directSignupError;
-
-    const signupFirst = candidate.toLowerCase().includes("signup");
-    const parsers = signupFirst
-      ? [
-          tryParseSignupGrant,
-          tryParseSignup,
-          tryParseSigninGrant,
-          tryParseSignin,
-        ]
-      : [
-          tryParseSigninGrant,
-          tryParseSignin,
-          tryParseSignupGrant,
-          tryParseSignup,
-        ];
-
-    for (const parse of parsers) {
-      const result = parse(candidate);
-      if (result.preview) return result.preview;
-      if (result.error) errors.push(result.error);
+      !allowedParams.has(name) ||
+      seen.has(name) ||
+      /[\u0000-\u001f\u007f]/.test(value)
+    ) {
+      throw new Error(INVALID_REQUEST);
     }
+    seen.add(name);
   }
-
-  throw new Error(errors[0] || "Expected a Pubky auth deeplink.");
-}
-
-async function registerIdentity(keypair: Keypair): Promise<void> {
-  const signer = pubky.signer(keypair);
-  const homeserver = PublicKey.from(TESTNET_HOMESERVER);
-
-  try {
-    await signer.signup(homeserver, null);
-  } catch (withoutTokenError) {
-    if (!isSignupTokenRequired(withoutTokenError))
-      throw pubkyOperationError(withoutTokenError, "register");
-
-    const signupToken = await generateSignupToken().catch((error: unknown) => {
-      throw pubkyOperationError(error, "register");
-    });
-
-    try {
-      await signer.signup(homeserver, signupToken);
-    } catch (withTokenError) {
-      throw pubkyOperationError(withTokenError, "register");
+  const relay = url.searchParams.get("relay");
+  if (relay !== config.relayUrl) {
+    const otherEnvironment =
+      environment === "staging" ? "production" : "staging";
+    if (relay === ENVIRONMENTS[otherEnvironment].relayUrl) {
+      throw new Error(
+        `This request uses ${ENVIRONMENTS[otherEnvironment].label}. Switch environments before approving it.`,
+      );
     }
-  }
-}
-
-async function generateSignupToken() {
-  const url = new URL("/generate_signup_token", TESTNET_HOMESERVER_ADMIN_URL);
-  const response = await pubky.client.fetch(url.toString(), {
-    method: "GET",
-    headers: {
-      "X-Admin-Password": TESTNET_HOMESERVER_ADMIN_PASSWORD,
-    },
-  });
-
-  if (!response.ok) {
     throw new Error(
-      `Homeserver admin returned ${response.status} ${response.statusText}.`,
+      `Only the official ${config.label} HTTPS approval relay is supported.`,
     );
   }
 
-  const token = (await response.text()).trim();
-  if (!token)
-    throw new Error(
-      "Homeserver admin returned an empty registration response.",
-    );
-  return token;
-}
-
-function tryParseSignin(url: string) {
+  let parsed: SigninDeepLink | SigninGrantDeepLink | undefined;
   try {
-    const link = SigninDeepLink.parse(url);
+    parsed = grant
+      ? SigninGrantDeepLink.parse(link)
+      : SigninDeepLink.parse(link);
+    if (parsed.baseRelayUrl !== config.relayUrl)
+      throw new Error(INVALID_REQUEST);
     return {
-      preview: {
-        authMode: "cookie" as const,
-        capabilities: splitCapabilities(link.capabilities),
-        kind: "signin" as const,
-        relay: link.baseRelayUrl,
-        url: link.toString(),
-        xCallback: normalizeCallbacks(link.xCallback),
-      },
+      authMode: grant ? "grant" : "cookie",
+      capabilities: parsed.capabilities
+        ? parsed.capabilities.split(",").filter(Boolean)
+        : [],
+      clientId:
+        parsed instanceof SigninGrantDeepLink ? parsed.clientId : undefined,
+      kind: "signin",
+      relay: parsed.baseRelayUrl,
+      url: parsed.toString(),
+      xCallback: normalizeCallbacks(parsed.xCallback),
     };
-  } catch (error) {
-    return { error: formatError(error) };
-  }
-}
-
-function tryParseSignup(url: string) {
-  try {
-    const link = SignupDeepLink.parse(url);
-    return {
-      preview: {
-        authMode: "cookie" as const,
-        capabilities: splitCapabilities(link.capabilities),
-        homeserver: link.homeserver.toString(),
-        kind: "signup" as const,
-        relay: link.baseRelayUrl,
-        url: link.toString(),
-        xCallback: normalizeCallbacks(link.xCallback),
-      },
-    };
-  } catch (error) {
-    return { error: formatError(error) };
-  }
-}
-
-function tryParseSigninGrant(url: string) {
-  try {
-    const link = SigninGrantDeepLink.parse(url);
-    return {
-      preview: {
-        authMode: "grant" as const,
-        capabilities: splitCapabilities(link.capabilities),
-        clientId: link.clientId,
-        kind: "signin" as const,
-        relay: link.baseRelayUrl,
-        url: link.toString(),
-        xCallback: normalizeCallbacks(link.xCallback),
-      },
-    };
-  } catch (error) {
-    return { error: formatError(error) };
-  }
-}
-
-function tryParseSignupGrant(url: string) {
-  try {
-    const link = SignupGrantDeepLink.parse(url);
-    return {
-      preview: {
-        authMode: "grant" as const,
-        capabilities: splitCapabilities(link.capabilities),
-        clientId: link.clientId,
-        homeserver: link.homeserver.toString(),
-        kind: "signup" as const,
-        relay: link.baseRelayUrl,
-        url: link.toString(),
-        xCallback: normalizeCallbacks(link.xCallback),
-      },
-    };
-  } catch (error) {
-    return { error: formatError(error) };
-  }
-}
-
-function tryParseDirectSignup(url: string) {
-  try {
-    const link = DirectSignupDeepLink.parse(url);
-    const homeserver = link.homeserver.toString();
-    return new Error(
-      "Direct signup requests are not supported. Add a test identity instead; " +
-        `the simulator registers it on its default local Homeserver (${homeserver}).`,
-    );
   } catch {
-    return undefined;
+    // SDK diagnostics can contain the auth URL and its temporary relay secret.
+    throw new Error(INVALID_REQUEST);
+  } finally {
+    parsed?.free();
   }
 }
 
-function normalizeCallbacks(callbacks: XCallbackParams) {
+function normalizeCallbacks(
+  callbacks: XCallbackParams,
+): AuthCallbacks | undefined {
   const normalized: AuthCallbacks = {
     xCancel: callbacks.xCancel || undefined,
     xError: callbacks.xError || undefined,
     xSource: callbacks.xSource || undefined,
     xSuccess: callbacks.xSuccess || undefined,
   };
-
   return Object.values(normalized).some(Boolean) ? normalized : undefined;
 }
 
-function extractAuthLink(input: string) {
-  const cleanInput = input.trim().replace(/&amp;/g, "&");
-  const match = cleanInput.match(/(?:pubkyauth|pubkyring):\/\/[^\s<>"'`]+/i);
-  const link = match ? match[0] : cleanInput;
-  const trimmed = match && match[0] !== cleanInput
-    ? link.replace(/[),.;]+$/, "")
-    : link;
-
-  if (!trimmed) throw new Error("Paste or scan a Pubky auth link first.");
-  return trimmed;
+function environmentConfig(environment: EnvironmentId) {
+  if (environment !== "staging" && environment !== "production") {
+    throw new Error("Choose Staging or Production first.");
+  }
+  return ENVIRONMENTS[environment];
 }
 
-function normalizeLooseAuthLink(link: string) {
-  return link.replace(/^pubkyauth:\/\/\/?\?/i, "pubkyauth://signin?");
+function assertCurrent(identity: SignerIdentity, isCurrent: () => boolean) {
+  if (disposedIdentities.has(identity) || !isCurrent())
+    throw new Error(CANCELLED);
 }
 
-function splitCapabilities(capabilities: string) {
-  return capabilities ? capabilities.split(",").filter(Boolean) : [];
-}
-
-function unique(values: string[]) {
-  return [...new Set(values)];
-}
-
-function isSignupTokenRequired(error: unknown) {
-  if (!(error instanceof Error) || error.name !== "RequestError") return false;
-
-  const data = isRecord(error) ? error.data : undefined;
-  return (
-    isRecord(data) &&
-    data.statusCode === 400 &&
-    error.message.toLowerCase().includes("token required")
-  );
-}
-
-type PubkyOperation = "approve" | "register" | "resolve";
-
-function pubkyOperationError(error: unknown, operation: PubkyOperation) {
-  const detail = formatError(error);
-  const name = error instanceof Error ? error.name : "";
-  let message: string;
-
-  if (name === "PkarrError") {
-    message = `PKARR could not resolve the identity's local Homeserver. ${detail}`;
-  } else if (name === "AuthenticationError") {
-    const subject =
-      operation === "approve"
-        ? "authorization"
-        : operation === "resolve"
-          ? "Homeserver resolution"
-          : "identity registration";
-    message = `The default local Homeserver rejected the ${subject}. ${detail}`;
-  } else if (name === "InvalidInput") {
-    const subject = operation === "approve" ? "auth request" : "identity data";
-    message = `The Pubky SDK rejected the ${subject}. ${detail}`;
-  } else if (operation === "approve") {
-    message = `Could not deliver the authorization to the request's relay. ${detail}`;
-  } else if (operation === "resolve") {
-    message = `Could not check the identity on the local testnet. ${detail}`;
-  } else {
-    message =
-      "Could not register the identity on the default local Homeserver. " +
-      `Start Pubky Docker and try again. ${detail}`;
+async function assertRegistered(
+  keypair: Keypair,
+  environment: EnvironmentId,
+  checkCurrent: () => void = () => {},
+) {
+  const config = environmentConfig(environment);
+  const publicKey = keypair.publicKey;
+  const expectedPublicKey = publicKey.toString();
+  let homeserver: Awaited<ReturnType<Pubky["getHomeserverOf"]>>;
+  try {
+    homeserver = await pubky.getHomeserverOf(publicKey);
+  } catch {
+    throw new Error(
+      "Could not check this identity's homeserver. Check your connection and try again.",
+    );
+  } finally {
+    publicKey.free();
   }
 
-  return new Error(message, { cause: error });
-}
+  let resolved: string | undefined;
+  try {
+    resolved = homeserver?.toString();
+  } finally {
+    homeserver?.free();
+  }
+  if (!resolved) {
+    throw new Error(
+      "This recovery phrase has no published homeserver. Import an existing registered identity.",
+    );
+  }
+  if (resolved !== config.homeserver) {
+    const otherEnvironment =
+      environment === "staging" ? "production" : "staging";
+    if (resolved === ENVIRONMENTS[otherEnvironment].homeserver) {
+      throw new Error(
+        `This identity belongs to ${ENVIRONMENTS[otherEnvironment].label}. Switch environments and import it there.`,
+      );
+    }
+    throw new Error(
+      "This identity uses a homeserver outside the supported Staging and Production environments.",
+    );
+  }
 
-function formatError(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+  // A published PKDNS pointer alone does not prove an account exists. SDK
+  // sign-in authenticates an existing account; it never creates one. Revoke
+  // this temporary validation grant before accepting the identity.
+  checkCurrent();
+  const signer = pubky.signer(keypair);
+  let session: Session | undefined;
+  let failed = false;
+  try {
+    session = await signer.signin("pubky-ring-simulator.validation");
+    const sessionInfo = session.info;
+    const sessionPublicKey = sessionInfo.publicKey;
+    try {
+      if (sessionPublicKey.toString() !== expectedPublicKey)
+        throw new Error(UNVERIFIED);
+    } finally {
+      sessionPublicKey.free();
+      sessionInfo.free();
+    }
+    const grant = session.grant;
+    if (!grant) throw new Error(UNVERIFIED);
+    try {
+      const grantInfo = await grant.sessionInfo();
+      const grantHomeserver = grantInfo.homeserver;
+      const grantPublicKey = grantInfo.publicKey;
+      try {
+        if (
+          grantHomeserver.toString() !== config.homeserver ||
+          grantPublicKey.toString() !== expectedPublicKey
+        )
+          throw new Error(UNVERIFIED);
+      } finally {
+        grantHomeserver.free();
+        grantPublicKey.free();
+        grantInfo.free();
+      }
+    } finally {
+      grant.free();
+    }
+  } catch {
+    failed = true;
+  } finally {
+    if (session) {
+      try {
+        await session.signout();
+      } catch {
+        failed = true;
+      } finally {
+        session.free();
+      }
+    }
+    signer.free();
+  }
+  if (failed) throw new Error(UNVERIFIED);
 }
