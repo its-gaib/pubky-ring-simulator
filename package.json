@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@scure/bip39": "2.4.0",
-    "@synonymdev/pubky": "^0.12.0",
+    "@synonymdev/pubky": "^0.14.0",
     "jdenticon": "^3.3.0",
     "pubky-app-specs": "0.7.0"
   },
