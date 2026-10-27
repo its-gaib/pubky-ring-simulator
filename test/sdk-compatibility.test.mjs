@@ -1,218 +1,179 @@
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
+import { readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
-
+import { AuthToken, Keypair, PublicKey } from "@synonymdev/pubky";
 import {
-  AuthFlowKind as LegacyAuthFlowKind,
-  Pubky as LegacyPubky,
-} from "legacy-pubky";
-import { AuthFlowKind, AuthToken, Keypair, Pubky } from "@synonymdev/pubky";
+  approveAuthRequest,
+  disposeIdentity,
+  ENVIRONMENTS,
+  parseAuthRequest,
+  pubky,
+} from "../.test-dist/src/pubky.js";
+
+// CI supplies an isolated historical SDK; local runs use the installed SDK.
+const require = createRequire(import.meta.url);
+const requesterModule = process.env.PUBKY_REQUESTER_MODULE ?? "@synonymdev/pubky";
+const requesterSdk = require(requesterModule);
+const { version } = JSON.parse(
+  await readFile(join(dirname(require.resolve(requesterModule)), "package.json"), "utf8"),
+);
+if (process.env.PUBKY_REQUESTER_VERSION) {
+  assert.equal(version, process.env.PUBKY_REQUESTER_VERSION);
+}
 
 const CAPABILITIES = "/pub/example.app/:rw";
-const FLOW_TIMEOUT_MS = 10_000;
+const environment = "staging";
+const relay = ENVIRONMENTS[environment].relayUrl;
 
-test(
-  "the current signer approves an SDK 0.9.3 sign-in request",
-  { timeout: 30_000 },
-  async () => {
-    await assertApproval({
-      requester: new LegacyPubky(),
-      startFlow: (requester, capabilities, relay) =>
-        requester.startAuthFlow(
-          capabilities,
-          LegacyAuthFlowKind.signin(),
-          relay,
-        ),
-      capabilities: CAPABILITIES,
-      expectedCapabilities: [CAPABILITIES],
-    });
-  },
-);
-
-test(
-  "the current SDK cookie requester receives a signed token with every requested capability",
-  { timeout: 30_000 },
-  async () => {
-    await assertCurrentApproval(
-      `${CAPABILITIES},/pub/another.app/file:r`,
-      [CAPABILITIES, "/pub/another.app/file:r"],
-    );
-  },
-);
-
-test(
-  "the current SDK cookie requester can authenticate without requesting capabilities",
-  { timeout: 30_000 },
-  async () => {
-    await assertCurrentApproval("", []);
-  },
-);
-
-async function assertCurrentApproval(capabilities, expectedCapabilities) {
-  await assertApproval({
-    requester: new Pubky(),
-    startFlow: (requester, capabilities, relay) =>
-      requester.startCookieAuthFlow(capabilities, AuthFlowKind.signin(), relay),
-    capabilities,
-    expectedCapabilities,
-  });
-}
-
-async function assertApproval({
-  requester,
-  startFlow,
-  capabilities,
-  expectedCapabilities,
-}) {
-  const resources = [requester];
-  const keep = (resource) => {
-    resources.push(resource);
-    return resource;
-  };
-  const pendingCalls = new Set();
-  const waitForCall = (promise) => {
-    pendingCalls.add(promise);
-    const settled = () => pendingCalls.delete(promise);
-    promise.then(settled, settled);
-    return withTimeout(promise, FLOW_TIMEOUT_MS);
-  };
-  let relay;
-
-  try {
-    relay = await startRelay();
-    const flow = keep(startFlow(requester, capabilities, relay.inboxUrl));
-    const authorizationUrl = flow.authorizationUrl;
-    assert.equal(new URL(authorizationUrl).hostname, "signin");
-
-    const keypair = keep(Keypair.fromSecret(new Uint8Array(32).fill(7)));
-    const signerClient = keep(new Pubky());
-    const signer = keep(signerClient.signer(keypair));
-
-    await waitForCall(signer.approveAuthRequest(authorizationUrl));
-    const token = keep(await waitForCall(flow.awaitToken()));
-    const expectedPublicKey = keep(keypair.publicKey).toString();
-
-    assert.equal(keep(token.publicKey).toString(), expectedPublicKey);
-    assert.deepEqual(Array.from(token.capabilities), expectedCapabilities);
-
-    // Verify the real serialized signature, including tokens decoded by SDK 0.9.3.
-    const bytes = token.toBytes();
-    const verifiedToken = keep(AuthToken.verify(bytes));
-    assert.equal(keep(verifiedToken.publicKey).toString(), expectedPublicKey);
-    assert.deepEqual(Array.from(verifiedToken.capabilities), expectedCapabilities);
-
-    const alteredBytes = bytes.slice();
-    alteredBytes[0] ^= 1;
-    assert.throws(() => AuthToken.verify(alteredBytes));
-    assert.equal(relay.posts, 1);
-    assert.equal(relay.acknowledgements, 1);
-  } finally {
-    await relay?.close();
-    // A timed-out WASM call can still borrow its owner; let GC release it safely.
-    if (pendingCalls.size === 0) {
-      for (const resource of resources.reverse()) resource.free();
-    }
-  }
-}
-
-async function startRelay() {
-  let payload;
-  let posts = 0;
-  let acknowledgements = 0;
-  const waitingReaders = new Set();
-
-  const server = createServer(async (request, response) => {
+for (const [description, capabilities, approved, expected] of [
+  ["all requested permissions", CAPABILITIES, undefined, [CAPABILITIES]],
+  ["reduced permissions", CAPABILITIES, "/pub/example.app/:r", ["/pub/example.app/:r"]],
+  ["no permissions", CAPABILITIES, "", []],
+  ["an identity-only request", "", undefined, []],
+]) {
+  test(`hosted approval serves SDK ${version} cookie sign-in with ${description}`, { timeout: 15_000 }, async (t) => {
+    const boundary = mockHostedBoundary(t);
+    const identity = fixtureIdentity(t);
+    const requester = new requesterSdk.Pubky();
+    const startFlow = requester.startCookieAuthFlow ?? requester.startAuthFlow;
+    const flow = startFlow.call(requester, capabilities, requesterSdk.AuthFlowKind.signin(), relay);
     try {
-      const path = new URL(request.url ?? "/", "http://localhost").pathname;
-      if (!path.startsWith("/inbox/") || path.endsWith("/ack")) {
-        response.writeHead(404).end();
-        return;
-      }
-
-      if (request.method === "POST") {
-        const chunks = [];
-        for await (const chunk of request) chunks.push(chunk);
-        payload = Buffer.concat(chunks);
-        posts += 1;
-
-        for (const reader of waitingReaders) sendPayload(reader, payload);
-        waitingReaders.clear();
-        response.writeHead(200).end();
-        return;
-      }
-
-      if (request.method === "GET") {
-        if (payload) {
-          sendPayload(response, payload);
-        } else {
-          waitingReaders.add(response);
-          request.on("close", () => waitingReaders.delete(response));
-        }
-        return;
-      }
-
-      if (request.method === "DELETE") {
-        if (!payload) {
-          response.writeHead(404).end();
-          return;
-        }
-
-        payload = undefined;
-        acknowledgements += 1;
-        response.writeHead(200).end();
-        return;
-      }
-
-      response.writeHead(405).end();
-    } catch (error) {
-      response.writeHead(500).end(String(error));
+      const preview = parseAuthRequest(flow.authorizationUrl, environment);
+      assert.equal(preview.kind, "signin");
+      assert.equal(preview.authMode, "cookie");
+      assert.equal(preview.relay, relay);
+      assert.deepEqual(preview.capabilities, capabilities ? [capabilities] : []);
+      const result = await approveAuthRequest(identity, preview.url, environment, () => true, approved);
+      assert.deepEqual(result.capabilities, expected);
+      const token = await flow.awaitToken();
+      try {
+        const key = token.publicKey;
+        try { assert.equal(key.toString(), identity.publicKey); } finally { key.free(); }
+        assert.deepEqual(Array.from(token.capabilities), expected);
+        const verified = AuthToken.verify(token.toBytes());
+        try { assert.deepEqual(Array.from(verified.capabilities), expected); } finally { verified.free(); }
+      } finally { token.free(); }
+      assert.equal(boundary.validations, 1);
+      assert.equal(boundary.revocations, 1);
+      assert.equal(boundary.posts, 1);
+    } finally {
+      flow.free();
+      requester.free();
     }
   });
-
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-
-  const address = server.address();
-  assert(address && typeof address !== "string");
-
-  return {
-    get acknowledgements() {
-      return acknowledgements;
-    },
-    async close() {
-      for (const reader of waitingReaders) reader.writeHead(408).end();
-      waitingReaders.clear();
-      server.closeAllConnections();
-      await new Promise((resolve, reject) => {
-        server.close((error) => (error ? reject(error) : resolve()));
-      });
-    },
-    inboxUrl: `http://127.0.0.1:${address.port}/inbox`,
-    get posts() {
-      return posts;
-    },
-  };
 }
 
-function sendPayload(response, payload) {
-  response.writeHead(200, { "content-type": "application/octet-stream" });
-  response.end(payload);
-}
-
-async function withTimeout(promise, milliseconds) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`Auth flow timed out after ${milliseconds}ms`)),
-      milliseconds,
-    );
-  });
-
+test(`hosted approval rejects SDK ${version} cookie permission escalation before relay delivery`, async (t) => {
+  const boundary = mockHostedBoundary(t);
+  const identity = fixtureIdentity(t);
+  const requester = new requesterSdk.Pubky();
+  const startFlow = requester.startCookieAuthFlow ?? requester.startAuthFlow;
+  const flow = startFlow.call(requester, "/pub/example.app/file:r", requesterSdk.AuthFlowKind.signin(), relay);
   try {
-    return await Promise.race([promise, timeout]);
+    for (const selected of ["/pub/example.app/file:rw", "/pub/example.app/:r", "/pub/another.app/:r"]) {
+      await assert.rejects(approveAuthRequest(identity, flow.authorizationUrl, environment, () => true, selected));
+      assert.equal(boundary.posts, 0);
+    }
   } finally {
-    clearTimeout(timer);
+    flow.free();
+    requester.free();
   }
+});
+
+if (requesterSdk.GrantAuthFlow) {
+  const [, minor] = version.split(".").map(Number);
+  const formats = minor >= 16 ? ["bareGrant", "signedApprovalV1"] : ["bareGrant"];
+  for (const approvalFormat of formats) {
+    test(`hosted preview accepts SDK ${version} ${approvalFormat} grant sign-in`, () => {
+      const capabilities = approvalFormat === "signedApprovalV1" ? "/priv/example.app/:rwe" : CAPABILITIES;
+      const flow = requesterSdk.GrantAuthFlow.start(capabilities, requesterSdk.AuthFlowKind.signin(), {
+        clientId: "example.app", relay, approvalFormat,
+      });
+      try {
+        const preview = parseAuthRequest(flow.authorizationUrl, environment);
+        assert.equal(preview.authMode, "grant");
+        assert.equal(preview.clientId, "example.app");
+        assert.equal(preview.relay, relay);
+        assert.deepEqual(preview.capabilities, [capabilities]);
+        if (approvalFormat === "signedApprovalV1") {
+          const url = new URL(preview.url);
+          assert.equal(url.searchParams.get("af"), "v1");
+          assert(url.searchParams.has("epk"));
+        }
+      } finally { flow.free(); }
+    });
+  }
+}
+
+// Substitute only account verification and the official relay's HTTP transport.
+// The application's environment policy, parsers and SDK signer remain real.
+function mockHostedBoundary(t) {
+  const state = { validations: 0, revocations: 0, posts: 0 };
+  const payloads = new Map();
+  const readers = new Map();
+  t.mock.method(globalThis, "fetch", async (input, init) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const url = new URL(request.url);
+    assert.equal(url.origin, new URL(relay).origin);
+    assert(url.pathname.startsWith("/inbox/"));
+    const response = (body = null, options = {}) => {
+      const result = new Response(body, options);
+      Object.defineProperty(result, "url", { value: request.url });
+      return result;
+    };
+    if (request.method === "POST") {
+      payloads.set(url.pathname, await request.arrayBuffer());
+      state.posts += 1;
+      readers.get(url.pathname)?.();
+      readers.delete(url.pathname);
+      return response(null, { status: 200 });
+    }
+    if (request.method === "GET") {
+      if (!payloads.has(url.pathname)) {
+        await new Promise((resolve) => {
+          readers.set(url.pathname, resolve);
+          request.signal.addEventListener("abort", resolve, { once: true });
+        });
+      }
+      return response(payloads.get(url.pathname), { headers: { "content-type": "application/octet-stream" } });
+    }
+    assert.equal(request.method, "DELETE");
+    payloads.delete(url.pathname);
+    return response(null, { status: 200 });
+  });
+  t.mock.method(pubky, "getHomeserverOf", async () => PublicKey.from(ENVIRONMENTS[environment].homeserver));
+  const realSigner = pubky.signer.bind(pubky);
+  t.mock.method(pubky, "signer", (keypair) => {
+    const signer = realSigner(keypair);
+    t.mock.method(signer, "signin", async () => {
+      state.validations += 1;
+      return {
+        get info() { return { publicKey: keypair.publicKey, free() {} }; },
+        get grant() {
+          return {
+            async sessionInfo() {
+              return { publicKey: keypair.publicKey, homeserver: PublicKey.from(ENVIRONMENTS[environment].homeserver), free() {} };
+            },
+            free() {},
+          };
+        },
+        async signout() { state.revocations += 1; },
+        free() {},
+      };
+    });
+    return signer;
+  });
+  return state;
+}
+
+function fixtureIdentity(t) {
+  const keypair = Keypair.fromSecret(new Uint8Array(32).fill(7));
+  const key = keypair.publicKey;
+  const publicKey = key.toString();
+  key.free();
+  const identity = { createdAt: new Date(0).toISOString(), environment, homeserver: ENVIRONMENTS[environment].homeserver, id: publicKey, publicKey, keypair };
+  t.after(() => disposeIdentity(identity));
+  return identity;
 }

@@ -814,6 +814,24 @@ h2 {
   color: #a0afc2;
   font-size: 0.66rem;
 }
+.permission-actions {
+  grid-column: 2 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.permission-actions label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #a0afc2;
+  font-size: 0.73rem;
+}
+.permission-actions input {
+  width: auto;
+  margin: 0;
+  accent-color: var(--ring-blue);
+}
 .muted {
   margin: 0;
   color: #a0afc2;

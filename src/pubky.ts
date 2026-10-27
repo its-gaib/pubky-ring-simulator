@@ -3,6 +3,7 @@ import {
   Pubky,
   SigninDeepLink,
   SigninGrantDeepLink,
+  validateCapabilities,
   type Session,
   type XCallbackParams,
 } from "@synonymdev/pubky";
@@ -110,6 +111,7 @@ export async function approveAuthRequest(
   input: string,
   environment: EnvironmentId,
   isCurrent: () => boolean = () => true,
+  approvedCapabilities?: string,
 ): Promise<AuthRequestPreview> {
   const config = environmentConfig(environment);
   const request = parseAuthRequest(input, environment);
@@ -130,7 +132,16 @@ export async function approveAuthRequest(
 
   const signer = pubky.signer(identity.keypair);
   try {
-    await signer.approveAuthRequest(request.url);
+    if (approvedCapabilities === undefined) {
+      await signer.approveAuthRequest(request.url);
+    } else {
+      const capabilities = validateCapabilities(approvedCapabilities);
+      await signer.approveAuthWithCapabilities(request.url, capabilities);
+      return {
+        ...request,
+        capabilities: capabilities ? capabilities.split(",") : [],
+      };
+    }
   } catch {
     throw new Error(
       "Could not deliver approval. Check the request is still active and try again.",
@@ -204,7 +215,7 @@ export function parseAuthRequest(
     "x-success",
     "x-error",
     "x-cancel",
-    ...(grant ? ["cid", "cpk"] : []),
+    ...(grant ? ["cid", "cpk", "af", "epk"] : []),
   ]);
   const seen = new Set<string>();
   for (const [name, value] of url.searchParams.entries()) {

@@ -19,6 +19,7 @@ import {
   type SignerIdentity,
 } from "../src/pubky.js";
 import { keypairFromRecoveryPhrase } from "../src/recovery.js";
+import { capabilityDetails, selectedCapabilities } from "../src/capabilities.js";
 
 // Public BIP39 test vector, never a real user's recovery phrase.
 const PHRASE =
@@ -247,6 +248,8 @@ test("rejects hostile auth routes, duplicate fields, unsupported fields, and con
     `${valid}&hs=${OTHER_HOMESERVER}`,
     `${valid}&st=signup-token`,
     authUrl("signin", "staging", { cid: "ignored-client" }),
+    authUrl("signin", "staging", { af: "v1" }),
+    authUrl("signin", "staging", { epk: CLIENT_PUBLIC_KEY }),
     "x".repeat(16_385),
     "not an auth request",
     "",
@@ -262,6 +265,8 @@ test("SDK rejects malformed capabilities and grant material without leaking requ
     { secret: "invalid-secret" },
     { cpk: "not-a-public-key" },
     { cid: "" },
+    { af: "unsupported-version" },
+    { af: "v1", epk: "not-an-encryption-key" },
   ];
   for (const overrides of cases) {
     assert.throws(
@@ -481,6 +486,62 @@ test("invalid environment identifiers fail closed", async () => {
   );
 });
 
+
+test("describes encryption permissions and preserves directory versus exact-path scope", () => {
+  assert.deepEqual(capabilityDetails("/priv/example.app/:rwe"), {
+    scope: "/priv/example.app/",
+    target: "Directory",
+    actions: [
+      { action: "r", label: "Read" },
+      { action: "w", label: "Write" },
+      { action: "e", label: "Encryption keys" },
+    ],
+  });
+  assert.equal(capabilityDetails("/priv/example.app/settings:e").target, "Exact path");
+  assert.deepEqual(selectedCapabilities(
+    ["/priv/example.app/:rwe", "/pub/example.app/file:r"],
+    ["re", "wre"],
+  ), ["/priv/example.app/:re", "/pub/example.app/file:r"]);
+  assert.deepEqual(selectedCapabilities(["/priv/example.app/:rwe"], [""]), []);
+});
+
+test("selective approval passes only selected permissions and returns the approved preview", async (t) => {
+  const state = mockNetwork(t);
+  const identity = fixtureIdentity(t);
+  const request = authUrl("signin_grant", "staging", { caps: "/priv/example.app/:rw" });
+  const preview = await approveAuthRequest(identity, request, "staging", () => true, "/priv/example.app/:r");
+  assert.deepEqual(preview.capabilities, ["/priv/example.app/:r"]);
+  assert.deepEqual(state.selectedCapabilities, ["/priv/example.app/:r"]);
+  assert.deepEqual(state.events, ["resolve", "signin", "signout", "approve-selected"]);
+  assert.equal(state.signersFreed, 2);
+});
+
+test("empty selective approval stays empty rather than restoring requested permissions", async (t) => {
+  const state = mockNetwork(t);
+  const preview = await approveAuthRequest(fixtureIdentity(t), authUrl(), "staging", () => true, "");
+  assert.deepEqual(preview.capabilities, []);
+  assert.deepEqual(state.selectedCapabilities, [""]);
+});
+
+test("selective approval cancellation during validation never signs selected capabilities", async (t) => {
+  let current = true;
+  const state = mockNetwork(t, { onSignout: async () => { current = false; } });
+  await assert.rejects(
+    approveAuthRequest(fixtureIdentity(t), authUrl(), "staging", () => current, "/pub/example.app/:r"),
+    /cancelled/,
+  );
+  assert.deepEqual(state.selectedCapabilities, []);
+});
+
+test("selective approval failures release the signer and conceal request secrets", async (t) => {
+  const state = mockNetwork(t, { approveError: new Error(authUrl()) });
+  await assert.rejects(
+    approveAuthRequest(fixtureIdentity(t), authUrl(), "staging", () => true, "/pub/example.app/:r"),
+    safeError,
+  );
+  assert.equal(state.signersFreed, 2);
+});
+
 function fixtureIdentity(t: TestContext): SignerIdentity {
   const keypair = Keypair.fromSecret(new Uint8Array(32).fill(7));
   const publicKey = keypair.publicKey;
@@ -521,6 +582,7 @@ function mockNetwork(t: TestContext, options: NetworkOptions = {}) {
     sessionsFreed: 0,
     signersFreed: 0,
     approvals: [] as string[],
+    selectedCapabilities: [] as string[],
     clientIds: [] as string[],
     events: [] as string[],
   };
@@ -585,6 +647,12 @@ function mockNetwork(t: TestContext, options: NetworkOptions = {}) {
             if (options.signoutError) throw options.signoutError;
           },
         } as unknown as Session;
+      },
+      async approveAuthWithCapabilities(url: string, capabilities: string) {
+        state.events.push("approve-selected");
+        state.approvals.push(url);
+        state.selectedCapabilities.push(capabilities);
+        if (options.approveError) throw options.approveError;
       },
       async approveAuthRequest(url: string) {
         state.events.push("approve");
