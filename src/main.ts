@@ -1,6 +1,7 @@
 import pubkyPackage from "@synonymdev/pubky/package.json";
 import { toSvg } from "jdenticon/browser";
 import "./style.css";
+import { capabilityDetails, selectedCapabilities } from "./capabilities";
 import { loadIdentityProfile } from "./profile";
 import {
   RECOVERY_WORD_COUNT,
@@ -46,6 +47,7 @@ interface Feedback {
 interface State {
   activeIdentityId?: string;
   authRequest?: AuthRequestPreview;
+  authApprovedActions: string[];
   busy?: string;
   environment: EnvironmentId;
   feedback?: Feedback;
@@ -68,6 +70,7 @@ const htmlEscapes: Record<string, string> = {
   "'": "&#039;",
 };
 const state: State = {
+  authApprovedActions: [],
   environment: "staging",
   identities: [],
   identityNames: {},
@@ -90,6 +93,7 @@ app.addEventListener("click", handleClick);
 app.addEventListener("submit", handleSubmit);
 app.addEventListener("paste", handleRecoveryPaste);
 app.addEventListener("input", handleRecoveryInput);
+app.addEventListener("change", handlePermissionChange);
 app.addEventListener("focusout", handleRecoveryBlur);
 app.addEventListener("keydown", handleRecoveryKeydown);
 app.addEventListener("error", handleProfileImageError, true);
@@ -346,6 +350,9 @@ function authorizeSources() {
 
 function authRequestPreview(request: AuthRequestPreview) {
   const source = request.xCallback?.xSource;
+  const requestsEncryptionKeys = request.capabilities.some((capability) =>
+    capabilityDetails(capability).actions.some(({ action }) => action === "e"),
+  );
   return `
     <div class="request-preview">
       <p class="eyebrow">${request.authMode === "grant" ? "Grant-based sign-in" : "Cookie-based sign-in"}</p>
@@ -355,7 +362,11 @@ function authRequestPreview(request: AuthRequestPreview) {
         <div><dt>Client ID</dt><dd><code>${request.clientId ? escapeHtml(request.clientId) : "Not provided by this request"}</code></dd></div>
         <div><dt>Approval relay</dt><dd>${escapeHtml(request.relay)}</dd></div>
       </dl>
-      <div class="permission-list"><h2>Requested access</h2>${request.capabilities.length ? request.capabilities.map(permissionPreview).join("") : '<p class="muted">No storage permissions requested.</p>'}</div>
+      <div class="permission-list"><h2>Requested access</h2>
+        ${request.capabilities.length ? '<p class="muted">Choose which permissions to approve. Clear all permissions for sign-in only.</p>' : ""}
+        ${request.capabilities.length ? request.capabilities.map(permissionPreview).join("") : '<p class="muted">No permissions requested.</p>'}
+        ${requestsEncryptionKeys ? '<p class="muted">Encryption keys remain usable after a grant expires or is revoked.</p>' : ""}
+      </div>
       <div class="request-actions">
         <button id="approve-auth-request" class="button accent wide" type="button" ${disabledAttr()}>${checkIcon()} Approve sign-in</button>
         <button id="cancel-auth-request" class="button secondary wide" type="button" ${disabledAttr()}>Cancel</button>
@@ -364,19 +375,44 @@ function authRequestPreview(request: AuthRequestPreview) {
   `;
 }
 
-function permissionPreview(capability: string) {
-  const separator = capability.lastIndexOf(":");
-  const scope = separator >= 0 ? capability.slice(0, separator) : capability;
-  const actions = separator >= 0 ? capability.slice(separator + 1) : "";
-  const access =
-    actions === "rw"
-      ? "Read and write"
-      : actions === "r"
-        ? "Read"
-        : actions === "w"
-          ? "Write"
-          : actions || "Unspecified";
-  return `<div class="permission"><span aria-hidden="true">${folderIcon()}</span><code>${escapeHtml(scope)}</code><small>${scope.endsWith("/") ? "Directory" : "Exact path"} · ${escapeHtml(access)}</small></div>`;
+function permissionPreview(capability: string, index: number) {
+  const { scope, actions, target } = capabilityDetails(capability);
+  return `
+    <div class="permission" role="group" aria-label="Permissions for ${escapeHtml(scope)}">
+      <span aria-hidden="true">${folderIcon()}</span>
+      <code>${escapeHtml(scope)}</code>
+      <small>${target}</small>
+      <div class="permission-actions">
+        ${actions.map(({ action, label }) => `
+          <label>
+            <input type="checkbox" data-capability-index="${index}" data-capability-action="${action}"
+              ${state.authApprovedActions[index]?.includes(action) ? "checked" : ""} ${disabledAttr()}>
+            ${label}
+          </label>
+        `).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function handlePermissionChange(event: Event) {
+  const input = event.target;
+  if (
+    !(input instanceof HTMLInputElement) ||
+    input.dataset.capabilityIndex === undefined
+  ) return;
+  if (state.busy || !state.authRequest) return;
+  const index = Number(input.dataset.capabilityIndex);
+  const action = input.dataset.capabilityAction;
+  const capability = state.authRequest.capabilities[index];
+  if (
+    !capability || !action ||
+    !capabilityDetails(capability).actions.some((item) => item.action === action)
+  ) return;
+  const selected = state.authApprovedActions[index] ?? "";
+  state.authApprovedActions[index] = input.checked
+    ? `${selected}${action}`
+    : selected.replaceAll(action, "");
 }
 
 function handleClick(event: MouseEvent) {
@@ -616,8 +652,12 @@ function previewAuthInput(input: string) {
   clearSensitiveFields();
   state.feedback = undefined;
   state.authRequest = undefined;
+  state.authApprovedActions = [];
   try {
     state.authRequest = parseAuthRequest(input, state.environment);
+    state.authApprovedActions = state.authRequest.capabilities.map((capability) =>
+      capabilityDetails(capability).actions.map(({ action }) => action).join(""),
+    );
   } catch (error) {
     setCoreError(
       error,
@@ -633,6 +673,10 @@ async function handleApproveAuthRequest() {
   const identity = activeIdentity();
   const request = state.authRequest;
   if (!identity || !request || state.busy) return;
+  const approvedCapabilities = selectedCapabilities(
+    request.capabilities,
+    state.authApprovedActions,
+  ).join(",");
   const epoch = sessionEpoch;
   const environment = state.environment;
   const isCurrent = () =>
@@ -644,7 +688,13 @@ async function handleApproveAuthRequest() {
   state.feedback = undefined;
   render();
   try {
-    await approveAuthRequest(identity, request.url, environment, isCurrent);
+    await approveAuthRequest(
+      identity,
+      request.url,
+      environment,
+      isCurrent,
+      approvedCapabilities,
+    );
     if (!isCurrent()) return;
     state.feedback = {
       kind: "success",
@@ -663,6 +713,7 @@ async function handleApproveAuthRequest() {
   } finally {
     if (sessionEpoch === epoch) {
       state.authRequest = undefined;
+      state.authApprovedActions = [];
       state.busy = undefined;
       clearSensitiveFields();
       render();
@@ -818,6 +869,7 @@ function navigate(route: Route, identityId = state.activeIdentityId) {
   stopScanCapture();
   clearSensitiveFields();
   state.authRequest = undefined;
+  state.authApprovedActions = [];
   state.feedback = undefined;
   state.route = route;
   state.activeIdentityId = identityId;
@@ -837,6 +889,7 @@ function clearSession() {
   state.identityNames = {};
   state.activeIdentityId = undefined;
   state.authRequest = undefined;
+  state.authApprovedActions = [];
   state.feedback = undefined;
   state.busy = undefined;
   state.route = "identities";

@@ -26,11 +26,19 @@ The original simulator is designed to create disposable identities on a local te
 3. Paste a `pubkyauth://` sign-in request into the approval form and preview it. Camera scanning
    is also available when the browser supports QR detection; pasting works in Firefox.
 4. Review the selected identity, environment, requesting application, relay, and permissions,
-   then explicitly approve or decline. Pasting or scanning never approves automatically.
+   choose which read, write, and encryption-key permissions to allow, then explicitly approve
+   or decline.
+   Clear every permission to sign in without granting access. Directory scopes end in `/`; other
+   scopes identify an exact path. Encryption keys already shared remain usable after a grant
+   expires or is revoked. Pasting or scanning never approves automatically.
 
-Both grant-based and legacy cookie sign-in requests are supported. Signup and direct-signup
-requests are rejected in the signing code. Approval links must use the selected environment's
-official HTTPS relay. HTTPS callback links, when provided, are opened only by an explicit click.
+Both grant-based and legacy cookie sign-in requests are supported, including signed, encrypted
+grant approvals (`af=v1`). Encryption permissions (`e`) require signed approvals and an upgraded
+homeserver; cookie requests cannot carry encryption-key permissions. Large sets of encryption
+keys may exceed the relay response-size limit. Declining a permission never grants extra access.
+
+Signup and direct-signup requests are rejected in the signing code. Approval links must use the
+selected environment's official HTTPS relay. HTTPS callback links, when provided, are opened only by an explicit click.
 
 ## Environments
 
@@ -88,10 +96,11 @@ npm run build
 npm run audit
 ```
 
-CI runs these checks on Node.js 22, 24, and 26. SDK interoperability tests use a local
-relay with current and legacy sign-in clients. The `legacy-pubky` development dependency
-stays pinned to 0.9.3 to retain coverage for older clients, and `@types/node` follows Node 22
-so test code remains compatible with the minimum supported runtime.
+CI runs these checks on Node.js 22, 24, and 26. SDK interoperability tests cover stable requester
+releases published within the preceding calendar year, using isolated historical packages and
+intercepted relay/account-validation requests. The hosted relay and account policies remain in
+force during these tests. `@types/node` follows Node 22 so test code remains compatible with the
+minimum supported runtime. Run `npm run test:compatibility` for the installed requester SDK.
 
 The automated tests cover the import/registration policy, mnemonic derivation, environment
 isolation, sign-in parsing, signup rejection, and approval consent boundaries. Testing approval
